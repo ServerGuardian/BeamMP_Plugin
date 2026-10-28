@@ -35,6 +35,16 @@ A recorded ban applies across all of your servers: the next time that account tr
 
 **Recording kicks (off by default).** Set `"recordKicks": true` in `config.json` and the plugin also records the built-in `kick <name> [reason]` as a kick. A kick never blocks anyone; it shows on the player's page and feeds their standing. BeamMP runs the kick first and tells the plugin afterwards, so the plugin matches the name against who was here a moment ago, and records nothing if it cannot tell exactly who was kicked. Names are held in memory only, and never logged or sent.
 
+## Player reports
+
+When the server owner turns **player reports** on for the server in the ServerGuardian portal (off by default), players can type `/report <player> <category> [what happened]` in chat (a guest has no account, so cannot send or be the subject of one). The report goes to the server's staff through ServerGuardian. Nobody else sees it, and it is never used to score or match anyone.
+
+- The categories are `cheating`, `griefing`, `harassment`, `hate_or_abuse` and `other`. A wrong one is answered with the list.
+- The first time a player reports in a session they are shown a notice (reports are kept for a limited time, and are not a chat log) and must type the same command again within two minutes to send it. After that, reports send straight away. Each player can send three reports in ten minutes.
+- `<player>` is a connected player's name, any case; a unique start of a name works. A player cannot report themselves, and a player with no account cannot be reported.
+- **What is sent:** the category, the optional note the player typed (cut to 200 characters), the account ids of the reporter and of the reported player, and a reference built from the reported player's name (letters and digits only) so staff can recognise it. **What is not sent:** chat, IP addresses, or anything else about either player. Nothing about a report (note, names, ids) is ever logged.
+- If ServerGuardian cannot be reached the player is told the report could not be sent. Reports need the key's ingest scope, which every normal key has.
+
 ## Shared core and tests
 
 `sg_core.lua` is shared with the [FiveM resource](https://github.com/ServerGuardian/FiveM_Plugin). **This repository is where it is edited.** After a change, run `./sync-core.sh` (it copies to `../FiveM_Plugin`) and commit there too.

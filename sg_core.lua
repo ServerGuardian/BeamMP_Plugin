@@ -6,14 +6,16 @@
 --
 -- Privacy rules this file enforces (docs/mods.md):
 --   * it never logs an IP address, player id, hardware id or name, only fixed messages and counts;
---   * it sends nothing but the fields of the join-check and action contracts, and sends no hardware id
---     unless the player explicitly said yes;
+--   * it sends nothing but the fields of the join-check, action and report contracts, and sends no
+--     hardware id unless the player explicitly said yes;
+--   * a player report carries a category, an optional short note the player typed, and the platform ids
+--     of the two players: never chat, a name (beyond the operator's own reference), or an address;
 --   * a blocked player is told only the fixed wording from the API, never why.
 
 ServerGuardianCore = ServerGuardianCore or {}
 local M = ServerGuardianCore
 
-M.VERSION = "0.2.0"
+M.VERSION = "0.3.0"
 
 -- Used until the API has been reached once, and whenever it cannot be. Kept short on purpose: the
 -- authoritative wording comes from GET /v1/mod/config so operators cannot change it.
@@ -29,6 +31,34 @@ M.DEFAULT_WORDING = {
   links = {},
 }
 
+-- What the report command says, until the API has been reached (the API's wording replaces the first
+-- four). The rest is local: it says what went wrong with the command itself.
+M.DEFAULT_REPORT_WORDING = {
+  notice = "Your report goes to this server's staff through ServerGuardian, and is kept for a limited "
+    .. "time. It is not a chat log: do not copy chat or personal details into it.",
+  thanks = "Thank you. Your report has been sent to this server's staff.",
+  tooMany = "You have sent several reports recently. Please try again later.",
+  categories = {
+    cheating = "Cheating",
+    griefing = "Griefing",
+    harassment = "Harassment",
+    hate_or_abuse = "Hate or abuse",
+    other = "Something else",
+  },
+}
+local REPORT_TEXT = {
+  off = "Reports are not enabled on this server.",
+  usage = "Usage: /report <player> <category> [what happened]",
+  confirm = "To send this report, type the same command again within 2 minutes.",
+  notFound = "No connected player matches that name.",
+  ambiguous = "More than one player matches that name. Type more of it.",
+  self = "You cannot report yourself.",
+  guest = "That player cannot be reported (no account).",
+  noAccount = "Reports need a signed-in account, so a guest cannot send one.",
+  failed = "Your report could not be sent. Please try again later.",
+}
+M.REPORT_TEXT = REPORT_TEXT
+
 local PLATFORM_ID_TYPES = { beammp = true, cfx_license = true, minecraft_uuid = true, steam = true }
 local MAX_PLATFORM_IDS = 8
 local ACTION_TYPES = { ban = true, kick = true, warn = true, mute = true }
@@ -36,6 +66,10 @@ local MAX_REASON_BYTES = 500 -- the API's limit is 500 characters, and a charact
 local MAX_DURATION_HOURS = 24 * 365 * 10
 local MAX_HARDWARE_TOKENS = 8
 local CONFIG_REFRESH_SECONDS = 3600
+local MAX_NOTE_BYTES = 200 -- the API's limit is 200 characters, and a character is at least a byte
+local REPORT_CONFIRM_SECONDS = 120
+local REPORTS_PER_WINDOW = 3 -- a player's own limit, so they are not told "too many" by the API
+local REPORT_WINDOW_SECONDS = 600
 
 local Guard = {}
 Guard.__index = Guard
@@ -65,6 +99,11 @@ function M.new(opts)
   self.prefix = opts.prefix or "sg"
   self.failMode = opts.failMode == "closed" and "closed" or "open"
   self.wording = M.DEFAULT_WORDING
+  self.reportWording = M.DEFAULT_REPORT_WORDING
+  self.reportsEnabled = false -- the operator turns reports on in the portal; absent means off
+  self.reportPending = {} -- player key -> { fingerprint, at }: a report waiting for its confirmation
+  self.reportConfirmed = {} -- player key -> true once they have seen the notice and confirmed
+  self.reportSent = {} -- player key -> list of times a report was sent, for the player's own limit
   self.configFetchedAt = nil
   self.counter = 0
   self.stats = { checks = 0, passes = 0, blocks = 0, errors = 0, skipped = 0 }
@@ -113,6 +152,15 @@ function Guard:refreshConfig(callback, force)
         if decoded.failMode == "open" or decoded.failMode == "closed" then
           self.failMode = decoded.failMode
         end
+        self.reportsEnabled = type(decoded.reports) == "table" and decoded.reports.enabled == true
+        local defaults = M.DEFAULT_REPORT_WORDING
+        local categories = type(en.reportCategories) == "table" and en.reportCategories or nil
+        self.reportWording = {
+          notice = type(en.reportNotice) == "string" and en.reportNotice or defaults.notice,
+          thanks = type(en.reportThanks) == "string" and en.reportThanks or defaults.thanks,
+          tooMany = type(en.reportTooMany) == "string" and en.reportTooMany or defaults.tooMany,
+          categories = categories or defaults.categories,
+        }
         self.configFetchedAt = now
         ok = true
       end
@@ -272,10 +320,10 @@ function Guard:leave(eventId)
   self.http("POST", "/v1/events/player-leave", { eventId = eventId }, function() end)
 end
 
---- Tidies text an operator typed into a reason: no control characters, one space between words, no
+--- Tidies text a person typed (a ban reason, a report note): no control characters, one space between words, no
 -- more than the API accepts (cut on a character boundary so the JSON stays valid UTF-8). Returns nil
 -- when nothing is left.
-local function cleanReason(text)
+local function cleanText(text, maxBytes)
   if type(text) ~= "string" then
     return nil
   end
@@ -283,8 +331,8 @@ local function cleanReason(text)
   if text == "" then
     return nil
   end
-  if #text > MAX_REASON_BYTES then
-    local cut = MAX_REASON_BYTES
+  if #text > maxBytes then
+    local cut = maxBytes
     while cut > 0 do
       local nextByte = text:byte(cut + 1)
       if nextByte and nextByte >= 0x80 and nextByte < 0xC0 then
@@ -296,6 +344,10 @@ local function cleanReason(text)
     text = text:sub(1, cut)
   end
   return text
+end
+
+local function cleanReason(text)
+  return cleanText(text, MAX_REASON_BYTES)
 end
 
 --- Records something the server's operator did to a player: a ban, kick, warning or mute. Only a ban
@@ -372,6 +424,160 @@ function Guard:liftAction(actionId, callback)
       callback({ ok = false, reason = "rejected", status = status })
     end
   end)
+end
+
+--- The id of a report, which the operator sees as its reference. It carries the reported player's name
+-- (letters and digits only, shortened) so staff can recognise it, and nothing about the reporter.
+function Guard:_reportEventId(label)
+  self.counter = self.counter + 1
+  local name = type(label) == "string" and label:gsub("[^A-Za-z0-9]", ""):sub(1, 24) or ""
+  if name == "" then
+    name = "player"
+  end
+  return string.format("rep-%s-%x-%x", name, self.now(), self.counter)
+end
+
+--- Sends one report. Checks the input first; nothing is sent if it is not valid.
+-- input: { category, note (optional), reporterIds = {{type,id},...}, reportedIds = {...}, label }
+--   (label is the reported player's name, used only to make the reference recognisable)
+-- callback receives { ok = true } or { ok = false, reason = "bad_input" | "disabled" | "too_many" |
+--   "unreachable" | "refused" | "rejected", status = number|nil }.
+function Guard:report(input, callback)
+  local function fail(reason, status)
+    callback({ ok = false, reason = reason, status = status })
+  end
+  if type(input) ~= "table" or not self.reportWording.categories[input.category] then
+    return fail("bad_input")
+  end
+  if not validPlatformIds(input.reporterIds) or not validPlatformIds(input.reportedIds) then
+    return fail("bad_input")
+  end
+  local body = {
+    eventId = self:_reportEventId(input.label),
+    category = input.category,
+    note = cleanText(input.note, MAX_NOTE_BYTES),
+    reporterPlatformIds = {},
+    reportedPlatformIds = {},
+  }
+  for _, platformId in ipairs(input.reporterIds) do
+    body.reporterPlatformIds[#body.reporterPlatformIds + 1] = { type = platformId.type, id = platformId.id }
+  end
+  for _, platformId in ipairs(input.reportedIds) do
+    body.reportedPlatformIds[#body.reportedPlatformIds + 1] = { type = platformId.type, id = platformId.id }
+  end
+  self.http("POST", "/v1/reports", body, function(status, responseBody)
+    if status == 202 then
+      callback({ ok = true })
+      return
+    end
+    -- Only the status is logged: never the note, a name or an id.
+    self.log("warn", "could not send a report (status " .. tostring(status) .. ")")
+    if status == nil then
+      return fail("unreachable")
+    elseif status == 429 then
+      return fail("too_many", status)
+    elseif status == 403 then
+      local decoded = type(responseBody) == "string" and self:_decode(responseBody) or nil
+      if decoded and decoded.error == "reports_disabled" then
+        self.reportsEnabled = false
+        return fail("disabled", status)
+      end
+      return fail("refused", status)
+    elseif status == 401 then
+      return fail("refused", status)
+    end
+    return fail("rejected", status)
+  end)
+end
+
+--- The whole /report command, the same on every platform. The platform file passes what it knows and
+-- a function to say things to the player; this file decides what to say and when to send.
+--   input.key         a string that is the same for one player for the whole session
+--   input.reporterIds the reporter's platform ids (nil when they have none, for example a guest)
+--   input.typed       what they typed for the player (a name), or nil
+--   input.category    what they typed for the category, or nil
+--   input.note        the rest of what they typed, or nil
+--   input.resolve     function(typed) -> player, or nil and one of "not_found", "ambiguous", "self",
+--                     "guest"; a player is { ids = {{type,id},...}, label = name }
+--   reply             function(text): says something to the reporter
+function Guard:reportCommand(input, reply)
+  local text = self.reportWording
+  if not self.reportsEnabled then
+    return reply(REPORT_TEXT.off)
+  end
+  if type(input.typed) ~= "string" or input.typed == "" or type(input.category) ~= "string" then
+    return reply(REPORT_TEXT.usage .. " " .. self:_categoryList())
+  end
+  local category = input.category:lower()
+  if not text.categories[category] then
+    return reply("Choose a category: " .. self:_categoryList())
+  end
+  if not validPlatformIds(input.reporterIds) then
+    return reply(REPORT_TEXT.noAccount)
+  end
+  local player, problem = input.resolve(input.typed)
+  if not player then
+    return reply(REPORT_TEXT[problem == "not_found" and "notFound" or problem] or REPORT_TEXT.notFound)
+  end
+
+  local now = self.now()
+  local key = input.key
+  -- The first report a player sends in a session is shown the notice, and sent only when they type the
+  -- same command again. After that they have seen it, and a report is sent straight away.
+  if not self.reportConfirmed[key] then
+    local fingerprint = player.label .. "|" .. category .. "|" .. tostring(input.note)
+    local pending = self.reportPending[key]
+    if not pending or pending.fingerprint ~= fingerprint or now - pending.at > REPORT_CONFIRM_SECONDS then
+      self.reportPending[key] = { fingerprint = fingerprint, at = now }
+      return reply(text.notice .. " " .. REPORT_TEXT.confirm)
+    end
+    self.reportPending[key] = nil
+    self.reportConfirmed[key] = true
+  end
+
+  local sent = {}
+  for _, at in ipairs(self.reportSent[key] or {}) do
+    if now - at < REPORT_WINDOW_SECONDS then
+      sent[#sent + 1] = at
+    end
+  end
+  self.reportSent[key] = sent
+  if #sent >= REPORTS_PER_WINDOW then
+    return reply(text.tooMany)
+  end
+  sent[#sent + 1] = now
+
+  self:report({
+    category = category,
+    note = input.note,
+    reporterIds = input.reporterIds,
+    reportedIds = player.ids,
+    label = player.label,
+  }, function(result)
+    if result.ok then
+      reply(text.thanks)
+    elseif result.reason == "too_many" then
+      reply(text.tooMany)
+    elseif result.reason == "disabled" then
+      reply(REPORT_TEXT.off)
+    else
+      reply(REPORT_TEXT.failed)
+    end
+  end)
+end
+
+--- "cheating (Cheating), griefing (Griefing), ..." in a steady order, for telling a player what to type.
+function Guard:_categoryList()
+  local ids = {}
+  for id in pairs(self.reportWording.categories) do
+    ids[#ids + 1] = id
+  end
+  table.sort(ids)
+  local parts = {}
+  for _, id in ipairs(ids) do
+    parts[#parts + 1] = id .. " (" .. tostring(self.reportWording.categories[id]) .. ")"
+  end
+  return table.concat(parts, ", ")
 end
 
 return M

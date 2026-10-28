@@ -8,6 +8,10 @@
 -- about bans this plugin provides console commands that record them: sgban, sgtempban and sgunban.
 -- It can also record the built-in `kick` (off by default: recordKicks in config.json).
 --
+-- When the server owner turns reports on in the ServerGuardian portal, players can type
+-- `/report <player> <category> [what happened]` in chat. It is sent to the server's staff through
+-- ServerGuardian and never shown to other players.
+--
 -- BeamMP's Lua has no HTTP client we can use (Http.CreateConnection only issues a GET and returns
 -- nothing), so this plugin calls curl. curl must be installed and on the PATH (or set curlPath).
 -- BeamMP exposes no hardware id, so this plugin never sends one.
@@ -285,6 +289,13 @@ end
 function onPlayerDisconnect(playerID)
   local eventId = joins[playerID]
   joins[playerID] = nil
+  if guard then
+    -- Forgotten, so an id BeamMP gives to someone new starts with no history.
+    local key = tostring(playerID)
+    guard.reportPending[key] = nil
+    guard.reportConfirmed[key] = nil
+    guard.reportSent[key] = nil
+  end
   if present[playerID] then
     recent[#recent + 1] = { name = present[playerID].name, beammp = present[playerID].beammp, left = os.time() }
     present[playerID] = nil
@@ -323,6 +334,7 @@ local function findPlayers(typed, includeRecent)
         local account = identifiers and identifiers.beammp
         consider(name, {
           id = tonumber(id),
+          name = name,
           beammp = (type(account) == "string" and account ~= "") and account or nil,
         })
       end
@@ -476,6 +488,66 @@ function onConsoleInput(input)
   return nil
 end
 
+-- ---------------------------------------------------------------------------------------------------
+-- /report. BeamMP passes every chat message to onChatMessage; returning 1 keeps a message from being
+-- shown to anyone, which is what we want for a report. The rules (the notice, the confirmation, the
+-- player's own limit) are in sg_core.lua; this only says who is who and how to talk to the player.
+-- ---------------------------------------------------------------------------------------------------
+
+local function say(playerID, text)
+  for _, part in ipairs(chunks(text, 180)) do
+    MP.SendChatMessage(playerID, part)
+  end
+end
+
+local function handleReport(playerID, rest)
+  local identifiers = MP.GetPlayerIdentifiers(playerID)
+  local account = identifiers and identifiers.beammp
+  local reporterIds = nil
+  if type(account) == "string" and account ~= "" then
+    reporterIds = { { type = "beammp", id = account } }
+  end
+  local typed, category, note = rest:match("^(%S+)%s*(%S*)%s*(.-)$")
+  guard:refreshConfig(nil, false)
+  guard:reportCommand({
+    key = tostring(playerID),
+    reporterIds = reporterIds,
+    typed = typed,
+    category = category ~= "" and category or nil,
+    note = note ~= "" and note or nil,
+    resolve = function(name)
+      local found = findPlayers(name, false)
+      if #found == 0 then
+        return nil, "not_found"
+      elseif #found > 1 then
+        return nil, "ambiguous"
+      end
+      local target = found[1]
+      if target.id == tonumber(playerID) or (target.beammp and target.beammp == account) then
+        return nil, "self"
+      elseif not target.beammp then
+        return nil, "guest"
+      end
+      return { ids = { { type = "beammp", id = target.beammp } }, label = target.name }
+    end,
+  }, function(text)
+    say(playerID, text)
+  end)
+end
+
+function onChatMessage(playerID, _playerName, message)
+  if not guard or type(message) ~= "string" then
+    return nil
+  end
+  local word, rest = message:match("^%s*/(%S+)%s*(.-)%s*$")
+  if not word or word:lower() ~= "report" then
+    return nil
+  end
+  handleReport(playerID, rest)
+  return 1
+end
+
+MP.RegisterEvent("onChatMessage", "onChatMessage")
 MP.RegisterEvent("onPlayerJoin", "onPlayerJoin")
 MP.RegisterEvent("onPlayerDisconnect", "onPlayerDisconnect")
 MP.RegisterEvent("onConsoleInput", "onConsoleInput")
