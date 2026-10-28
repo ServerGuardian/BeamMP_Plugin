@@ -1,0 +1,6 @@
+name: ServerGuardian
+version: "${version}"
+main: com.serverguardian.mc.ServerGuardianPlugin
+api-version: "1.21"
+description: Checks joining players against accounts banned elsewhere. The server only learns pass or block.
+website: https://serverguardian.example

@@ -1,0 +1,19 @@
+# ServerGuardian for Paper. Get your API key from your ServerGuardian dashboard.
+
+# The API address, with no path and no trailing slash.
+api-base: "https://api.serverguardian.example"
+
+# Your server's API key. Keep this file private.
+api-key: "sg_xxxxxxxx_paste-your-key-here"
+
+# What to do when ServerGuardian cannot be reached: "open" lets players stay, "closed" removes them.
+# Once the API has been reached, the setting chosen in your ServerGuardian dashboard wins.
+fail-mode: "open"
+
+# How long to wait for an answer before applying fail-mode, in milliseconds (1000 to 10000).
+timeout-ms: 3000
+
+# Minecraft account ids can only be trusted when the server (or the proxy in front of it) checks
+# accounts with Mojang. In offline mode they can be made up by anyone, so ServerGuardian will not
+# start unless you set this to true to confirm a trusted proxy (Velocity or BungeeCord) is in front.
+trust-offline-mode-uuids: false
