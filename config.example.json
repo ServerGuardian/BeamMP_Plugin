@@ -3,5 +3,6 @@
   "apiKey": "sg_xxxxxxxx_paste-your-key-here",
   "failMode": "open",
   "timeoutSeconds": 3,
-  "curlPath": "curl"
+  "curlPath": "curl",
+  "recordKicks": false
 }

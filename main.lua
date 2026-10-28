@@ -4,6 +4,10 @@
 -- player may stay, and removes them if the answer is "block". The server operator only ever learns
 -- pass or block. See docs/mods.md.
 --
+-- BeamMP-Server has no ban system of its own (only a console `kick`), so for ServerGuardian to learn
+-- about bans this plugin provides console commands that record them: sgban, sgtempban and sgunban.
+-- It can also record the built-in `kick` (off by default: recordKicks in config.json).
+--
 -- BeamMP's Lua has no HTTP client we can use (Http.CreateConnection only issues a GET and returns
 -- nothing), so this plugin calls curl. curl must be installed and on the PATH (or set curlPath).
 -- BeamMP exposes no hardware id, so this plugin never sends one.
@@ -14,6 +18,12 @@ local DEFAULT_DIR = "Resources/Server/ServerGuardian"
 local guard = nil -- the ServerGuardianCore instance, created in onInit
 local settings = nil
 local joins = {} -- playerID -> eventId of the join we checked
+-- Only when recordKicks is on: who is here and who left in the last few seconds, so a console `kick`
+-- typed after the player is gone can still be matched. Names are held in memory only. They are never
+-- logged or sent anywhere.
+local present = {} -- playerID -> { name = lowercased name, beammp = account id }
+local recent = {} -- { name, beammp, left = os.time() }
+local RECENT_SECONDS = 15
 
 local function log(level, message)
   -- Fixed messages only: never a player's name, address or id.
@@ -74,6 +84,7 @@ local function loadSettings()
     curl = curl,
     timeout = timeout,
     failMode = decoded.failMode == "closed" and "closed" or "open",
+    recordKicks = decoded.recordKicks == true,
   }
 end
 
@@ -250,6 +261,14 @@ function onPlayerJoin(playerID)
     platformIds[1] = { type = "beammp", id = identifiers.beammp }
   end
 
+  if settings.recordKicks and #platformIds > 0 then
+    local names = MP.GetPlayers()
+    local name = type(names) == "table" and names[playerID]
+    if type(name) == "string" and name ~= "" then
+      present[playerID] = { name = name:lower(), beammp = identifiers.beammp }
+    end
+  end
+
   if #platformIds > 0 and not showNotice(playerID) then
     log("warn", "the notice could not be shown, so this player was not checked")
     return
@@ -266,10 +285,197 @@ end
 function onPlayerDisconnect(playerID)
   local eventId = joins[playerID]
   joins[playerID] = nil
+  if present[playerID] then
+    recent[#recent + 1] = { name = present[playerID].name, beammp = present[playerID].beammp, left = os.time() }
+    present[playerID] = nil
+  end
   if guard and eventId then
     guard:leave(eventId)
   end
 end
 
+-- ---------------------------------------------------------------------------------------------------
+-- Console commands. BeamMP calls onConsoleInput with the full text of anything typed in the server
+-- console that it does not handle itself, and for its own commands (such as `kick`) after they have
+-- run. Returning a string prints it; returning nothing leaves the command to others.
+-- ---------------------------------------------------------------------------------------------------
+
+local MAX_HOURS = 24 * 365 * 10
+
+-- Who is connected and matches what was typed. An exact name (any case) wins; otherwise a name that
+-- starts with it, which must be unique. Returns the matches, each { id (or nil), beammp (or nil) }.
+local function findPlayers(typed, includeRecent)
+  typed = typed:lower()
+  local exact, prefix = {}, {}
+  local function consider(name, entry)
+    local lowered = name:lower()
+    if lowered == typed then
+      exact[#exact + 1] = entry
+    elseif lowered:sub(1, #typed) == typed then
+      prefix[#prefix + 1] = entry
+    end
+  end
+  local names = MP.GetPlayers()
+  if type(names) == "table" then
+    for id, name in pairs(names) do
+      if type(name) == "string" then
+        local identifiers = MP.GetPlayerIdentifiers(id)
+        local account = identifiers and identifiers.beammp
+        consider(name, {
+          id = tonumber(id),
+          beammp = (type(account) == "string" and account ~= "") and account or nil,
+        })
+      end
+    end
+  end
+  if includeRecent then
+    local now = os.time()
+    for i = #recent, 1, -1 do
+      if now - recent[i].left > RECENT_SECONDS then
+        table.remove(recent, i)
+      else
+        consider(recent[i].name, { beammp = recent[i].beammp })
+      end
+    end
+  end
+  if #exact > 0 then
+    return exact
+  end
+  return prefix
+end
+
+-- Finds the one player a command is about, or the sentence to print instead.
+local function onePlayer(typed, includeRecent)
+  if typed == "" then
+    return nil, "Say which player: the command needs a player name."
+  end
+  local found = findPlayers(typed, includeRecent)
+  if #found == 0 then
+    return nil, "No connected player matches that name."
+  elseif #found > 1 then
+    return nil, "More than one player matches that name. Type more of it."
+  end
+  return found[1]
+end
+
+local REFUSED = "The key was refused. Make a key that is allowed to record actions, in the ServerGuardian portal."
+
+local function describeFailure(result)
+  if result.reason == "unreachable" then
+    return "ServerGuardian could not be reached."
+  elseif result.reason == "refused" then
+    return REFUSED
+  end
+  return "ServerGuardian did not accept it."
+end
+
+local function banPlayer(typed, hours, reason)
+  local player, problem = onePlayer(typed, false)
+  if not player then
+    return problem
+  end
+  if not player.beammp then
+    -- Nothing stable to record a ban against, so nothing is done: use the built-in kick for a guest.
+    return "That player is a guest and has no BeamMP account, so a ban cannot be recorded. Nothing was done."
+  end
+  local outcome
+  guard:recordAction({
+    type = "ban",
+    reason = reason or "Banned by the server console",
+    durationHours = hours,
+    platformIds = { { type = "beammp", id = player.beammp } },
+  }, function(result)
+    outcome = result
+  end)
+  -- The operator asked for this player to go, so they go whether or not ServerGuardian was reached.
+  MP.DropPlayer(player.id, guard.wording.blocked)
+  if outcome and outcome.ok then
+    return "Player removed and the ban recorded in ServerGuardian. To end it early: sgunban " .. outcome.actionId
+  end
+  return "Player removed, but the ban was NOT recorded. " .. describeFailure(outcome or {}) .. " They can rejoin."
+end
+
+local function handleBan(rest, temporary)
+  local typed, remainder = rest:match("^(%S+)%s*(.-)$")
+  if not typed then
+    return temporary and "Usage: sgtempban <player> <hours> [reason]" or "Usage: sgban <player> [reason]"
+  end
+  local hours = nil
+  if temporary then
+    local count, reason = remainder:match("^(%d+)%s*(.-)$")
+    hours = count and tonumber(count)
+    if not hours or hours < 1 or hours > MAX_HOURS then
+      return "Usage: sgtempban <player> <hours> [reason]  (hours: a whole number from 1 to " .. MAX_HOURS .. ")"
+    end
+    remainder = reason
+  end
+  return banPlayer(typed, hours, remainder ~= "" and remainder or nil)
+end
+
+local function handleUnban(rest)
+  local id = rest:match("^(%S+)$")
+  if not id then
+    return "Usage: sgunban <ban id>  (the id printed when the ban was recorded)"
+  end
+  local outcome
+  guard:liftAction(id, function(result)
+    outcome = result
+  end)
+  outcome = outcome or {}
+  if outcome.ok then
+    return "The ban was ended."
+  elseif outcome.reason == "bad_input" then
+    return "That is not a ban id."
+  elseif outcome.reason == "not_found" then
+    return "No active ban or mute with that id belongs to this server owner."
+  end
+  return describeFailure(outcome)
+end
+
+-- Records the built-in `kick` after it has run (recordKicks). We only know the name that was typed, so
+-- if it does not pick out exactly one player we say nothing rather than guess.
+local function observeKick(rest)
+  local typed, reason = rest:match("^(%S+)%s*(.-)$")
+  if not typed then
+    return
+  end
+  local found = findPlayers(typed, true)
+  if #found ~= 1 or not found[1].beammp then
+    log("info", "a kick was typed but it could not be matched to one player with an account, so it was not recorded")
+    return
+  end
+  guard:recordAction({
+    type = "kick",
+    reason = reason ~= "" and reason or "Kicked by the server console",
+    platformIds = { { type = "beammp", id = found[1].beammp } },
+  }, function(result)
+    if not result.ok then
+      log("warn", "could not record a kick")
+    end
+  end)
+end
+
+function onConsoleInput(input)
+  if not guard or type(input) ~= "string" then
+    return nil
+  end
+  local word, rest = input:match("^%s*(%S+)%s*(.-)%s*$")
+  if not word then
+    return nil
+  end
+  word = word:lower()
+  if word == "sgban" then
+    return handleBan(rest, false)
+  elseif word == "sgtempban" then
+    return handleBan(rest, true)
+  elseif word == "sgunban" then
+    return handleUnban(rest)
+  elseif word == "kick" and settings.recordKicks then
+    observeKick(rest)
+  end
+  return nil
+end
+
 MP.RegisterEvent("onPlayerJoin", "onPlayerJoin")
 MP.RegisterEvent("onPlayerDisconnect", "onPlayerDisconnect")
+MP.RegisterEvent("onConsoleInput", "onConsoleInput")

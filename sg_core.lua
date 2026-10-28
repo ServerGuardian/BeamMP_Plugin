@@ -6,14 +6,14 @@
 --
 -- Privacy rules this file enforces (docs/mods.md):
 --   * it never logs an IP address, player id, hardware id or name, only fixed messages and counts;
---   * it sends nothing but the fields of the join-check contract, and sends no hardware id unless the
---     player explicitly said yes;
+--   * it sends nothing but the fields of the join-check and action contracts, and sends no hardware id
+--     unless the player explicitly said yes;
 --   * a blocked player is told only the fixed wording from the API, never why.
 
 ServerGuardianCore = ServerGuardianCore or {}
 local M = ServerGuardianCore
 
-M.VERSION = "0.1.0"
+M.VERSION = "0.2.0"
 
 -- Used until the API has been reached once, and whenever it cannot be. Kept short on purpose: the
 -- authoritative wording comes from GET /v1/mod/config so operators cannot change it.
@@ -31,6 +31,9 @@ M.DEFAULT_WORDING = {
 
 local PLATFORM_ID_TYPES = { beammp = true, cfx_license = true, minecraft_uuid = true, steam = true }
 local MAX_PLATFORM_IDS = 8
+local ACTION_TYPES = { ban = true, kick = true, warn = true, mute = true }
+local MAX_REASON_BYTES = 500 -- the API's limit is 500 characters, and a character is at least a byte
+local MAX_DURATION_HOURS = 24 * 365 * 10
 local MAX_HARDWARE_TOKENS = 8
 local CONFIG_REFRESH_SECONDS = 3600
 
@@ -131,6 +134,25 @@ function Guard:_decode(body)
   return nil
 end
 
+--- True when the list is one to eight well-formed platform ids.
+local function validPlatformIds(list)
+  if type(list) ~= "table" or #list < 1 or #list > MAX_PLATFORM_IDS then
+    return false
+  end
+  for _, platformId in ipairs(list) do
+    if
+      type(platformId) ~= "table"
+      or not PLATFORM_ID_TYPES[platformId.type]
+      or type(platformId.id) ~= "string"
+      or platformId.id == ""
+      or #platformId.id > 128
+    then
+      return false
+    end
+  end
+  return true
+end
+
 --- Checks the input has what the contract needs. Returns nil and a short reason if not.
 local function validate(input)
   if type(input) ~= "table" then
@@ -139,19 +161,11 @@ local function validate(input)
   if type(input.ip) ~= "string" or input.ip == "" or #input.ip > 64 then
     return nil, "no_ip"
   end
-  if type(input.platformIds) ~= "table" or #input.platformIds < 1 or #input.platformIds > MAX_PLATFORM_IDS then
+  if type(input.platformIds) ~= "table" or #input.platformIds < 1 then
     return nil, "no_platform_id"
   end
-  for _, platformId in ipairs(input.platformIds) do
-    if
-      type(platformId) ~= "table"
-      or not PLATFORM_ID_TYPES[platformId.type]
-      or type(platformId.id) ~= "string"
-      or platformId.id == ""
-      or #platformId.id > 128
-    then
-      return nil, "bad_platform_id"
-    end
+  if not validPlatformIds(input.platformIds) then
+    return nil, "bad_platform_id"
   end
   return true
 end
@@ -256,6 +270,108 @@ function Guard:leave(eventId)
     return
   end
   self.http("POST", "/v1/events/player-leave", { eventId = eventId }, function() end)
+end
+
+--- Tidies text an operator typed into a reason: no control characters, one space between words, no
+-- more than the API accepts (cut on a character boundary so the JSON stays valid UTF-8). Returns nil
+-- when nothing is left.
+local function cleanReason(text)
+  if type(text) ~= "string" then
+    return nil
+  end
+  text = text:gsub("%c", " "):gsub("%s+", " "):match("^%s*(.-)%s*$")
+  if text == "" then
+    return nil
+  end
+  if #text > MAX_REASON_BYTES then
+    local cut = MAX_REASON_BYTES
+    while cut > 0 do
+      local nextByte = text:byte(cut + 1)
+      if nextByte and nextByte >= 0x80 and nextByte < 0xC0 then
+        cut = cut - 1
+      else
+        break
+      end
+    end
+    text = text:sub(1, cut)
+  end
+  return text
+end
+
+--- Records something the server's operator did to a player: a ban, kick, warning or mute. Only a ban
+-- (or a mute) may have a duration; without one a ban is permanent. The reason is operator-written text,
+-- so it is the one free-text field this file sends; it is cleaned and limited first.
+-- input: { type = "ban"|"kick"|"warn"|"mute", reason, durationHours (optional), platformIds = {...} }
+-- callback receives { ok = true, actionId = string } or { ok = false, reason = "bad_input" |
+--   "unreachable" | "refused" | "rejected", status = number|nil }. "refused" means the key may not
+--   record actions (401 or 403).
+function Guard:recordAction(input, callback)
+  local function fail(reason, status)
+    callback({ ok = false, reason = reason, status = status })
+  end
+  if type(input) ~= "table" or not ACTION_TYPES[input.type] then
+    return fail("bad_input")
+  end
+  local reason = cleanReason(input.reason)
+  if not reason or not validPlatformIds(input.platformIds) then
+    return fail("bad_input")
+  end
+  local hours = input.durationHours
+  if hours ~= nil then
+    if
+      (input.type ~= "ban" and input.type ~= "mute")
+      or math.type(hours) ~= "integer"
+      or hours < 1
+      or hours > MAX_DURATION_HOURS
+    then
+      return fail("bad_input")
+    end
+  end
+  local body = { eventId = self:newEventId(), type = input.type, reason = reason, platformIds = {} }
+  for _, platformId in ipairs(input.platformIds) do
+    body.platformIds[#body.platformIds + 1] = { type = platformId.type, id = platformId.id }
+  end
+  body.durationHours = hours
+  self.http("POST", "/v1/actions", body, function(status, responseBody)
+    if status == 201 and type(responseBody) == "string" then
+      local decoded = self:_decode(responseBody)
+      if decoded and type(decoded.id) == "string" and decoded.id:match("^[%x%-]+$") then
+        callback({ ok = true, actionId = decoded.id })
+        return
+      end
+    end
+    self.log("warn", "could not record an action (status " .. tostring(status) .. ")")
+    if status == nil then
+      return fail("unreachable")
+    elseif status == 401 or status == 403 then
+      return fail("refused", status)
+    end
+    return fail("rejected", status)
+  end)
+end
+
+--- Ends a ban or mute early, using the id recordAction returned. The id goes into the request address,
+-- so only the exact shape the API issues is accepted.
+-- callback receives { ok = true } or { ok = false, reason = "bad_input" | "unreachable" | "refused" |
+--   "not_found" | "rejected", status = number|nil }.
+function Guard:liftAction(actionId, callback)
+  if type(actionId) ~= "string" or #actionId ~= 36 or not actionId:match("^[%x%-]+$") then
+    callback({ ok = false, reason = "bad_input" })
+    return
+  end
+  self.http("POST", "/v1/actions/" .. actionId .. "/lift", nil, function(status)
+    if status == 204 then
+      callback({ ok = true })
+    elseif status == nil then
+      callback({ ok = false, reason = "unreachable" })
+    elseif status == 401 or status == 403 then
+      callback({ ok = false, reason = "refused", status = status })
+    elseif status == 404 then
+      callback({ ok = false, reason = "not_found", status = status })
+    else
+      callback({ ok = false, reason = "rejected", status = status })
+    end
+  end)
 end
 
 return M
