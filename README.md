@@ -10,7 +10,7 @@ A BeamMP server plugin that asks ServerGuardian whether a joining player is link
 2. Copy `config.example.json` to `config.json` and set the API address and your server's API key (made in the ServerGuardian portal).
 3. Restart the server. The plugin needs `curl` on the host.
 
-Players with a BeamMP guest session have no account id, so they cannot be checked or banned; they are let in and nothing is sent.
+Players with a BeamMP guest session have no account id, so they cannot be checked or banned; they are let in and nothing is sent. That makes guests a way around any ban. To refuse them, set `AllowGuests = false` under `[General]` in BeamMP's `ServerConfig.toml` (or `BEAMMP_ALLOW_GUESTS=false`): it is BeamMP's own setting, and your choice.
 
 ## How it works
 
