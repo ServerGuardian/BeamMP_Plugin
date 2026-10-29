@@ -1,8 +1,14 @@
 {
   "apiBase": "https://api.serverguardian.example",
   "apiKey": "sg_xxxxxxxx_paste-your-key-here",
-  "failMode": "open",
   "timeoutSeconds": 3,
   "curlPath": "curl",
-  "recordKicks": false
+  "recordKicks": false,
+  "settings": {
+    "failMode": "open",
+    "gameEvents": false,
+    "reports": false,
+    "shareBans": true,
+    "youthOriented": false
+  }
 }

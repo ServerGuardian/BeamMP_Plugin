@@ -13,12 +13,16 @@
 --   * a game event (a spawn, or a movement flag) carries the id of the player's join, a short label,
 --     and either an item name or the kind of check: never a position, a coordinate, chat, an address
 --     or a platform id. The movement checks run here, on the game server, and send only a flag;
+--   * the server's settings (fail mode, game events, reports, shared bans, youth-oriented) are set in the
+--     platform's config file; they are sent to the API as five yes/no or open/closed values and nothing
+--     else, and only those the file actually sets (a missing one is never sent, so an older config
+--     file cannot reset what the server had);
 --   * a blocked player is told only the fixed wording from the API, never why.
 
 ServerGuardianCore = ServerGuardianCore or {}
 local M = ServerGuardianCore
 
-M.VERSION = "0.5.0"
+M.VERSION = "0.6.0"
 
 -- Used until the API has been reached once, and whenever it cannot be. Kept short on purpose: the
 -- authoritative wording comes from GET /v1/mod/config so operators cannot change it.
@@ -260,9 +264,54 @@ function Tracker:sample(key, t, x, y, z, checks, owner, coarse)
 end
 
 
+-- The settings a server's config file may hold (decision D41 follow-up). The portal shows them but
+-- cannot change them.
+local SETTING_NAMES = { "failMode", "gameEvents", "reports", "shareBans", "youthOriented" }
+local KNOWN_SETTING = {}
+for _, name in ipairs(SETTING_NAMES) do
+  KNOWN_SETTING[name] = true
+end
+
+--- Keeps the settings that are present and valid: failMode must be "open" or "closed", the others true
+-- or false. Anything else is ignored as if it were not set, with a fixed line that names the setting
+-- but never repeats what was written. A name this plugin does not know is reported without echoing it.
+function M.cleanSettings(raw, log)
+  local clean = {}
+  log = log or function() end
+  if type(raw) ~= "table" then
+    return clean
+  end
+  for _, name in ipairs(SETTING_NAMES) do
+    local value = raw[name]
+    if value ~= nil then
+      local valid
+      if name == "failMode" then
+        valid = value == "open" or value == "closed"
+      else
+        valid = type(value) == "boolean"
+      end
+      if valid then
+        clean[name] = value
+      else
+        log("warn", "the setting " .. name .. " is not valid, so it is not used")
+      end
+    end
+  end
+  for name in pairs(raw) do
+    if type(name) == "string" and not KNOWN_SETTING[name] then
+      log("warn", "the settings hold a name this plugin does not know (check the spelling)")
+      break
+    end
+  end
+  return clean
+end
+
 --- Creates a guard.
 -- opts.apiBase       API address without a trailing slash
--- opts.failMode      "open" (default) or "closed": what to do when we cannot be reached
+-- opts.failMode      "open" (default) or "closed": what to do until the API has answered, and the
+--                    answer the portal used to give; opts.settings.failMode, when set, always wins
+-- opts.settings      the config file's settings: { failMode, gameEvents, reports, shareBans,
+--                    youthOriented }, each optional; invalid ones are ignored (see cleanSettings)
 -- opts.http          function(method, path, bodyTable_or_nil, callback) ; callback(status, bodyString)
 --                    status is nil when the request failed or timed out
 -- opts.json          { encode = fn, decode = fn }
@@ -285,16 +334,19 @@ function M.new(opts)
     return math.random(0, 65535)
   end
   self.prefix = opts.prefix or "sg"
-  self.failMode = opts.failMode == "closed" and "closed" or "open"
+  self.localSettings = M.cleanSettings(opts.settings, opts.log)
+  -- The config file's fail mode is used from the start, whether or not the API has ever been reached.
+  self.failMode = self.localSettings.failMode or (opts.failMode == "closed" and "closed" or "open")
+  self.settingsSending = false
   self.wording = M.DEFAULT_WORDING
   self.reportWording = M.DEFAULT_REPORT_WORDING
-  self.reportsEnabled = false -- the operator turns reports on in the portal; absent means off
+  self.reportsEnabled = false -- on only when the config file or the API says so; absent means off
   self.reportPending = {} -- player key -> { fingerprint, at }: a report waiting for its confirmation
   self.reportConfirmed = {} -- player key -> true once they have seen the notice and confirmed
   self.reportSent = {} -- player key -> list of times a report was sent, for the player's own limit
   self.clock = opts.clock or self.now -- seconds, and finer than a second where the platform allows
   self.coarseClock = opts.clock == nil -- the movement checks only have whole seconds
-  self.gameEnabled = false -- the operator turns game events on in the portal; absent means off
+  self.gameEnabled = false -- on only when the config file or the API says so; absent means off
   self.gameChecks = nil
   self.gameBackoffUntil = 0
   self.gameSpawnSent = {} -- player key -> list of times a spawn was sent
@@ -330,6 +382,41 @@ function Guard:refreshConfig(callback, force)
     end
     return
   end
+  -- First tell the API what the config file says (only what it sets), then ask for the wording.
+  self:_sendSettings(function()
+    self:_fetchConfig(now, callback)
+  end)
+end
+
+--- Sends the settings the config file sets to PUT /v1/mod/settings, then calls `done`. Sends nothing
+-- when the file sets none. Quiet on every failure: the local values are used either way.
+function Guard:_sendSettings(done)
+  local body = {}
+  local any = false
+  for _, name in ipairs(SETTING_NAMES) do
+    if self.localSettings[name] ~= nil then
+      body[name] = self.localSettings[name]
+      any = true
+    end
+  end
+  if not any or self.settingsSending then
+    return done()
+  end
+  self.settingsSending = true
+  self.http("PUT", "/v1/mod/settings", body, function(status)
+    self.settingsSending = false
+    if status ~= 200 then
+      if status == 429 then
+        self.log("warn", "ServerGuardian refused the settings (too many changes in an hour), using the config file")
+      else
+        self.log("warn", "could not send the settings to ServerGuardian, using the config file")
+      end
+    end
+    done()
+  end)
+end
+
+function Guard:_fetchConfig(now, callback)
   self.http("GET", "/v1/mod/config", nil, function(status, body)
     local ok = false
     if status == 200 and type(body) == "string" then
@@ -347,10 +434,18 @@ function Guard:refreshConfig(callback, force)
           blocked = en.blocked,
           links = type(decoded.links) == "table" and decoded.links or {},
         }
-        if decoded.failMode == "open" or decoded.failMode == "closed" then
+        -- The config file wins; the API's answer is for servers whose file does not set it.
+        if
+          self.localSettings.failMode == nil
+          and (decoded.failMode == "open" or decoded.failMode == "closed")
+        then
           self.failMode = decoded.failMode
         end
-        self.reportsEnabled = type(decoded.reports) == "table" and decoded.reports.enabled == true
+        if self.localSettings.reports ~= nil then
+          self.reportsEnabled = self.localSettings.reports
+        else
+          self.reportsEnabled = type(decoded.reports) == "table" and decoded.reports.enabled == true
+        end
         local defaults = M.DEFAULT_REPORT_WORDING
         local categories = type(en.reportCategories) == "table" and en.reportCategories or nil
         self.reportWording = {
@@ -359,7 +454,15 @@ function Guard:refreshConfig(callback, force)
           tooMany = type(en.reportTooMany) == "string" and en.reportTooMany or defaults.tooMany,
           categories = categories or defaults.categories,
         }
-        self:_setGameConfig(decoded.gameEvents)
+        local gameSettings = decoded.gameEvents
+        if self.localSettings.gameEvents ~= nil then
+          -- The file decides whether they are on; the limits for the checks still come from the API.
+          gameSettings = {
+            enabled = self.localSettings.gameEvents,
+            checks = type(decoded.gameEvents) == "table" and decoded.gameEvents.checks or nil,
+          }
+        end
+        self:_setGameConfig(gameSettings)
         self.configFetchedAt = now
         ok = true
       end

@@ -97,7 +97,12 @@ local function loadSettings()
     base = base,
     curl = curl,
     timeout = timeout,
+    -- The old top-level failMode only matters until the API has answered, as before; the "settings"
+    -- block below is what sets the server's behaviour now.
     failMode = decoded.failMode == "closed" and "closed" or "open",
+    -- The server's settings (fail mode, game events, reports, shared bans, youth-oriented). The core
+    -- checks them and sends the ones that are set.
+    rawSettings = type(decoded.settings) == "table" and decoded.settings or nil,
     recordKicks = decoded.recordKicks == true,
   }
 end
@@ -231,6 +236,7 @@ function onInit()
   guard = ServerGuardianCore.new({
     apiBase = settings.base,
     failMode = settings.failMode,
+    settings = settings.rawSettings,
     http = httpForCore,
     json = { encode = Util.JsonEncode, decode = Util.JsonDecode },
     log = log,

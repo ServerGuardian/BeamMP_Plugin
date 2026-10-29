@@ -1,16 +1,34 @@
 # ServerGuardian for BeamMP
 
-A BeamMP server plugin that asks ServerGuardian whether a joining player is linked to an account banned elsewhere. The server only learns **pass** or **block**: never why, never who. If ServerGuardian cannot be reached, players are let in (or kept out, if you set the server to fail closed).
+A BeamMP server plugin that asks ServerGuardian whether a joining player is linked to an account banned elsewhere. The server only learns **pass** or **block**: never why, never who. If ServerGuardian cannot be reached, players are let in (or kept out, if you set `failMode` to `closed`).
 
 **Status:** tested end to end under a fake BeamMP environment (from the Backend repository), **not yet on a real BeamMP server** (decision D17).
 
 ## Install
 
 1. Copy `main.lua`, `sg_core.lua` and `config.example.json` into `Resources/Server/ServerGuardian/` on your BeamMP server.
-2. Copy `config.example.json` to `config.json` and set the API address and your server's API key (made in the ServerGuardian portal).
+2. Copy `config.example.json` to `config.json` and set the API address and your server's API key (made in the ServerGuardian portal), then check the `settings` block (see Settings below).
 3. Restart the server. The plugin needs `curl` on the host.
 
 Players with a BeamMP guest session have no account id, so they cannot be checked or banned; they are let in and nothing is sent. That makes guests a way around any ban. To refuse them, set `AllowGuests = false` under `[General]` in BeamMP's `ServerConfig.toml` (or `BEAMMP_ALLOW_GUESTS=false`): it is BeamMP's own setting, and your choice.
+
+## Settings
+
+This server's behaviour is set in **`config.json`, in the `settings` object**, next to the API key. The ServerGuardian portal only **shows** what each server is set to (read-only, with when the plugin last reported it); it cannot change them.
+
+| Setting | Values | Default | What it does |
+|---|---|---|---|
+| `failMode` | `open` or `closed` | `open` | What happens when ServerGuardian cannot be reached. `open` lets players in; `closed` keeps them out. It applies from here even if ServerGuardian has never been reached. |
+| `gameEvents` | `true` or `false` | `false` | Send spawns (where the game allows) and run ServerGuardian's movement checks, sending only a flag. See "Game events" below. |
+| `reports` | `true` or `false` | `false` | Let players report each other with `/report`. See "Player reports" below. |
+| `shareBans` | `true` or `false` | `true` | Use bans recorded on your other ServerGuardian servers here too, and share this server's bans with them. Turn it off for a server that should keep its own list. Bans reported to other server owners are not affected. |
+| `youthOriented` | `true` or `false` | `false` | This server or event is for players under 18. Their data is handled more strictly: no hardware check, shorter records, and game events are neither kept nor sent on to webhooks. |
+
+- Use JSON `true` and `false` without quotes.
+- **Any setting you leave out keeps the value it already had**, so an older config file never changes a server's youth-oriented protection or anything else.
+- A value that is not valid (for example `"yes"` instead of `true`) is ignored, with a line in the log that names the setting but never repeats what was written.
+- The plugin tells ServerGuardian its settings when it starts and at every refresh (every ten minutes), so a change applies after a restart or at the next refresh. A server can change its settings at most **10 times an hour**; if that is exceeded the plugin carries on with what the file says and logs that ServerGuardian refused the change.
+- Join rules (what blocks a player: your own bans, other owners' bans, account links, minimum standing) are still set in the portal.
 
 ## How it works
 
@@ -37,7 +55,7 @@ A recorded ban applies across all of your servers: the next time that account tr
 
 ## Player reports
 
-When the server owner turns **player reports** on for the server in the ServerGuardian portal (off by default), players can type `/report <player> <category> [what happened]` in chat (a guest has no account, so cannot send or be the subject of one). The report goes to the server's staff through ServerGuardian. Nobody else sees it, and it is never used to score or match anyone.
+When **`reports`** is `true` in `settings` (off by default), players can type `/report <player> <category> [what happened]` in chat (a guest has no account, so cannot send or be the subject of one). The report goes to the server's staff through ServerGuardian. Nobody else sees it, and it is never used to score or match anyone.
 
 - The categories are `cheating`, `griefing`, `harassment`, `hate_or_abuse` and `other`. A wrong one is answered with the list.
 - The first time a player reports in a session they are shown a notice (reports are kept for a limited time, and are not a chat log) and must type the same command again within two minutes to send it. After that, reports send straight away. Each player can send three reports in ten minutes.
@@ -47,7 +65,7 @@ When the server owner turns **player reports** on for the server in the ServerGu
 
 ## Game events
 
-When the server owner turns **game events** on for the server in the ServerGuardian portal (off by default: "Let the plugin send game events"), the plugin tells ServerGuardian when a player **spawns a vehicle** and runs two **movement checks** on the server: a speed or a jump the game could not produce, and a change of speed that is not believable. The operator sees them in the portal (on plans that keep history) and can have them sent to a webhook.
+When **`gameEvents`** is `true` in `settings` (off by default), the plugin tells ServerGuardian when a player **spawns a vehicle** and runs two **movement checks** on the server: a speed or a jump the game could not produce, and a change of speed that is not believable. The operator sees them in the portal (on plans that keep history) and can have them sent to a webhook.
 
 - **What is sent:** for a spawn, the short name of what was spawned (the `jbm` model name in the spawn data, or just `vehicle` if it cannot be read); for a flag, which check failed (`impossible_move` or `acceleration`) and whether it was `low` or `high`. Both carry the id of the player's join (the reference ServerGuardian already has for them) and a short label, the player's in-game name with only letters, digits, spaces and `_ . : / -` kept. **What is never sent:** a position or any coordinate, chat, an IP address, a platform id, or a hardware id. Nothing about an event (label, item, ids) is ever logged.
 - **The numbers come from ServerGuardian.** The speed, jump and acceleration limits, and how often to look, are in the settings the plugin already fetches, so they can be tuned without a new release. They are placeholders until they have been tried on real servers.
