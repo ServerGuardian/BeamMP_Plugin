@@ -18,7 +18,7 @@
 ServerGuardianCore = ServerGuardianCore or {}
 local M = ServerGuardianCore
 
-M.VERSION = "0.4.0"
+M.VERSION = "0.5.0"
 
 -- Used until the API has been reached once, and whenever it cannot be. Kept short on purpose: the
 -- authoritative wording comes from GET /v1/mod/config so operators cannot change it.
@@ -76,10 +76,15 @@ local REPORT_WINDOW_SECONDS = 600
 
 -- Game events (decision D41, group 2). The API's own limit is 600 events a minute per key, so a
 -- player is held to far less, and the whole server to a little under that.
-local GAME_EVENTS_PER_PLAYER_WINDOW = 20
+local GAME_SPAWNS_PER_PLAYER_WINDOW = 20 -- spawns and flags have a limit each, so spam of one cannot starve the other
+local GAME_FLAGS_PER_PLAYER_WINDOW = 10
 local GAME_EVENT_WINDOW_SECONDS = 60
 local GAME_EVENTS_PER_SERVER_WINDOW = 400
-local GAME_BACKOFF_SECONDS = 60
+local GAME_BACKOFF_SECONDS = 60 -- after a 429
+local GAME_REFUSED_BACKOFF_SECONDS = 600 -- after a 401, 402 or 403: the key or the account is not usable
+local GAME_CONFIG_MAX_AGE_SECONDS = 10800 -- game events switch themselves off if settings cannot be refreshed for this long
+local MIN_SAMPLE_SECONDS = 1
+local MAX_SAMPLE_SECONDS = 10
 local MAX_LABEL = 32
 local MAX_ITEM = 40
 local GAP_FACTOR = 3 -- a gap longer than this many sample periods starts the track again
@@ -124,39 +129,72 @@ local Tracker = {}
 Tracker.__index = Tracker
 
 function M.newTracker()
-  return setmetatable({ tracks = {} }, Tracker)
+  -- `cooldowns` is kept per owner (the player), not per track, so a player with several vehicles is
+  -- still flagged once for each check in a cooldown, and deleting a vehicle does not clear it.
+  return setmetatable({ tracks = {}, cooldowns = {} }, Tracker)
 end
 
 --- Forget what is known about this key, so the next sample is a fresh start (a respawn, a teleport
--- command, a change of world, a vehicle reset).
-function Tracker:reset(key)
+-- command, a change of world, a vehicle reset). `skip` samples after it are ignored as well, for a
+-- platform whose position is not yet right straight after.
+function Tracker:reset(key, skip)
   local track = self.tracks[key]
+  if not track and skip then
+    track = {}
+    self.tracks[key] = track
+  end
   if track then
     track.last = nil
     track.speed = nil
+    track.over = nil
+    track.skip = skip
   end
 end
 
---- Forget the key altogether (the player or vehicle has gone).
+--- A new track whose first `skip` samples are ignored (a vehicle that has just spawned).
+function Tracker:start(key, skip)
+  self.tracks[key] = { skip = skip }
+end
+
+--- Forget the key altogether (the vehicle has gone). A cooldown already started is kept.
 function Tracker:forget(key)
   self.tracks[key] = nil
+end
+
+--- Forget an owner's cooldowns (the player has left).
+function Tracker:forgetOwner(owner)
+  self.cooldowns[owner] = nil
 end
 
 --- Takes one sample. `checks` is what the API serves (sampleSeconds, impossibleMove.maxSpeed and
 -- .teleportDistance, acceleration.maxAcceleration, flagCooldownSeconds). Returns a list of flags,
 -- each { check = "impossible_move" | "acceleration", severity = "low" | "high" }, usually empty.
 -- The first sample, a gap longer than three sample periods, and the sample after a reset only set
--- the starting point.
-function Tracker:sample(key, t, x, y, z, checks)
+-- the starting point. `owner` (default: the key) is who the cooldown belongs to. With `coarse` set
+-- (the clock only counts whole seconds, so a stalled plugin thread can make a time difference look
+-- shorter than it was), a speed or a change of speed is flagged only when the sample before it was
+-- over the line too; a jump in distance does not depend on the clock and is flagged at once.
+function Tracker:sample(key, t, x, y, z, checks, owner, coarse)
   local track = self.tracks[key]
   if not track then
-    track = { flagged = {} }
+    track = {}
     self.tracks[key] = track
+  end
+  if track.skip and track.skip > 0 then
+    track.skip = track.skip - 1
+    return {}
+  end
+  owner = owner or key
+  local cooldowns = self.cooldowns[owner]
+  if not cooldowns then
+    cooldowns = {}
+    self.cooldowns[owner] = cooldowns
   end
   local last = track.last
   track.last = { t = t, x = x, y = y, z = z }
   if not last then
     track.speed = nil
+    track.over = nil
     return {}
   end
   local dt = t - last.t
@@ -166,6 +204,7 @@ function Tracker:sample(key, t, x, y, z, checks)
   end
   if dt > GAP_FACTOR * checks.sampleSeconds then
     track.speed = nil
+    track.over = nil
     return {}
   end
   local dx, dy, dz = x - last.x, y - last.y, z - last.z
@@ -173,32 +212,49 @@ function Tracker:sample(key, t, x, y, z, checks)
   local speed = distance / dt
   local previousSpeed = track.speed
   track.speed = speed
+  local previousOver = track.over or {}
+  local over = {}
+  track.over = over
 
   local flags = {}
-  local function consider(check, ratio)
+  local function consider(check, ratio, confirmed)
     if ratio <= 1 then
       return false
     end
-    local lastFlag = track.flagged[check]
+    local lastFlag = cooldowns[check]
     if lastFlag and t - lastFlag < checks.flagCooldownSeconds then
       return true -- over the line, but flagged a moment ago
     end
-    track.flagged[check] = t
+    cooldowns[check] = t
     flags[#flags + 1] = { check = check, severity = ratio > HIGH_RATIO and "high" or "low" }
     return true
   end
 
-  local moveRatio = math.max(
-    speed / checks.impossibleMove.maxSpeed,
-    distance / checks.impossibleMove.teleportDistance
-  )
-  if consider("impossible_move", moveRatio) then
+  local speedRatio = speed / checks.impossibleMove.maxSpeed
+  local distanceRatio = distance / checks.impossibleMove.teleportDistance
+  if coarse and speedRatio > 1 then
+    over.speed = true
+    if not previousOver.speed then
+      speedRatio = 0 -- the first one over the line only counts if the next is over too
+    end
+  end
+  if consider("impossible_move", math.max(speedRatio, distanceRatio)) then
     -- A jump is not a change of speed: do not also flag it, or the sample after it.
     track.speed = nil
     return flags
   end
   if previousSpeed then
-    consider("acceleration", math.abs(speed - previousSpeed) / dt / checks.acceleration.maxAcceleration)
+    local ratio = math.abs(speed - previousSpeed) / dt / checks.acceleration.maxAcceleration
+    if coarse and ratio > 1 then
+      -- Speeding up and then slowing down again is one spike, not two: it counts only when the
+      -- change of speed is over the line twice in the same direction.
+      local direction = speed > previousSpeed and 1 or -1
+      over.acceleration = direction
+      if previousOver.acceleration ~= direction then
+        ratio = 0
+      end
+    end
+    consider("acceleration", ratio)
   end
   return flags
 end
@@ -212,6 +268,8 @@ end
 -- opts.json          { encode = fn, decode = fn }
 -- opts.log           function(level, message) ; messages never contain player data
 -- opts.now           function() -> seconds (default os.time)
+-- opts.clock         function() -> seconds, finer than a second if the platform has such a clock (the
+--                    movement checks use it). Without one the checks use opts.now and are more careful.
 -- opts.random        function() -> integer 0..65535 (default math.random)
 -- opts.prefix        short id prefix for event ids, e.g. "bm" or "fx"
 function M.new(opts)
@@ -235,10 +293,12 @@ function M.new(opts)
   self.reportConfirmed = {} -- player key -> true once they have seen the notice and confirmed
   self.reportSent = {} -- player key -> list of times a report was sent, for the player's own limit
   self.clock = opts.clock or self.now -- seconds, and finer than a second where the platform allows
+  self.coarseClock = opts.clock == nil -- the movement checks only have whole seconds
   self.gameEnabled = false -- the operator turns game events on in the portal; absent means off
   self.gameChecks = nil
   self.gameBackoffUntil = 0
-  self.gamePlayerSent = {} -- player key -> list of times a game event was sent
+  self.gameSpawnSent = {} -- player key -> list of times a spawn was sent
+  self.gameFlagSent = {} -- player key -> list of times a flag was sent
   self.gameServerSent = {} -- times of every game event sent, for the whole server
   self.tracker = M.newTracker()
   self.onGameConfig = nil -- set by the platform: called when game events are switched on or off
@@ -306,6 +366,11 @@ function Guard:refreshConfig(callback, force)
     end
     if not ok then
       self.log("warn", "could not load ServerGuardian settings, using the built-in wording")
+      -- A refusal (the key was revoked, the plan paused it, the account is not allowed) means game
+      -- events are off. A failure to get an answer at all keeps what we had, which times out below.
+      if status == 401 or status == 402 or status == 403 then
+        self:_applyGameConfig(false, nil)
+      end
     end
     if callback then
       callback(ok)
@@ -313,40 +378,57 @@ function Guard:refreshConfig(callback, force)
   end)
 end
 
+--- True if every number is finite and above zero.
+local function positive(value)
+  return type(value) == "number" and value == value and value > 0 and value < math.huge
+end
+
 --- Reads the `gameEvents` part of the settings: off unless it says `enabled: true` with the numbers the
 -- checks need. Anything missing or odd means off. Tells the platform when it changes.
 function Guard:_setGameConfig(settings)
-  local enabled, checks = false, nil
-  if type(settings) == "table" and settings.enabled == true and type(settings.checks) == "table" then
-    local c = settings.checks
-    local move, accel = c.impossibleMove, c.acceleration
-    if
-      type(c.sampleSeconds) == "number" and c.sampleSeconds > 0
-      and type(c.flagCooldownSeconds) == "number"
-      and type(move) == "table" and type(move.maxSpeed) == "number" and move.maxSpeed > 0
-      and type(move.teleportDistance) == "number" and move.teleportDistance > 0
-      and type(accel) == "table" and type(accel.maxAcceleration) == "number" and accel.maxAcceleration > 0
-    then
-      enabled = true
-      checks = {
-        sampleSeconds = c.sampleSeconds,
-        flagCooldownSeconds = c.flagCooldownSeconds,
-        impossibleMove = { maxSpeed = move.maxSpeed, teleportDistance = move.teleportDistance },
-        acceleration = { maxAcceleration = accel.maxAcceleration },
-      }
-    end
+  if type(settings) ~= "table" or settings.enabled ~= true then
+    self:_applyGameConfig(false, nil)
+    return
   end
-  self:_applyGameConfig(enabled, checks)
+  -- On, but the numbers the checks need must all be sane. If they are not, the checks stay off
+  -- (spawns can still go) rather than running with zeros.
+  local checks = nil
+  local c = type(settings.checks) == "table" and settings.checks or nil
+  local move = c and type(c.impossibleMove) == "table" and c.impossibleMove or nil
+  local accel = c and type(c.acceleration) == "table" and c.acceleration or nil
+  if
+    c and move and accel
+    and positive(c.sampleSeconds)
+    and positive(c.flagCooldownSeconds) and c.flagCooldownSeconds >= 1
+    and positive(move.maxSpeed)
+    and positive(move.teleportDistance)
+    and positive(accel.maxAcceleration)
+  then
+    checks = {
+      sampleSeconds = math.min(MAX_SAMPLE_SECONDS, math.max(MIN_SAMPLE_SECONDS, c.sampleSeconds)),
+      flagCooldownSeconds = c.flagCooldownSeconds,
+      impossibleMove = { maxSpeed = move.maxSpeed, teleportDistance = move.teleportDistance },
+      acceleration = { maxAcceleration = accel.maxAcceleration },
+    }
+  elseif settings.checks ~= nil then
+    self.log("warn", "the movement-check settings from ServerGuardian were not usable, so the checks are off")
+  end
+  self:_applyGameConfig(true, checks)
 end
 
 function Guard:_applyGameConfig(enabled, checks)
+  local oldChecks = self.gameChecks
   local changed = enabled ~= self.gameEnabled
-    or (enabled and self.gameChecks and self.gameChecks.sampleSeconds ~= checks.sampleSeconds)
+    or (oldChecks == nil) ~= (checks == nil)
+    or (oldChecks ~= nil and checks ~= nil and oldChecks.sampleSeconds ~= checks.sampleSeconds)
   self.gameEnabled = enabled
   self.gameChecks = checks
+  if not checks then
+    self.tracker = M.newTracker() -- nothing is kept while the checks are off
+  end
   if not enabled then
-    self.tracker = M.newTracker() -- nothing is kept while it is off
-    self.gamePlayerSent = {}
+    self.gameSpawnSent = {}
+    self.gameFlagSent = {}
     self.gameServerSent = {}
   end
   if changed and self.onGameConfig then
@@ -770,9 +852,10 @@ function Guard:_gameEventId()
   return string.format("ev-%s-%x-%x", self.prefix, self.now(), self.counter)
 end
 
---- True when this player may have another event sent now, counting it if so. Keeps the server well
--- inside the API's own limit, and one busy player from using it all.
-function Guard:_gameAllowance(playerKey)
+--- True when this player may have another event of this kind ("spawn" or "flag") sent now, counting
+-- it if so. Keeps the server well inside the API's own limit, and one busy player from using it all;
+-- spawns and flags are counted separately so spam of one does not hide the other.
+function Guard:_gameAllowance(playerKey, kind)
   local now = self.now()
   local function recent(list)
     local kept = {}
@@ -783,15 +866,40 @@ function Guard:_gameAllowance(playerKey)
     end
     return kept
   end
-  local mine = recent(self.gamePlayerSent[playerKey] or {})
+  local sent = kind == "flag" and self.gameFlagSent or self.gameSpawnSent
+  local limit = kind == "flag" and GAME_FLAGS_PER_PLAYER_WINDOW or GAME_SPAWNS_PER_PLAYER_WINDOW
+  local mine = recent(sent[playerKey] or {})
   local all = recent(self.gameServerSent)
-  self.gamePlayerSent[playerKey] = mine
+  sent[playerKey] = mine
   self.gameServerSent = all
-  if #mine >= GAME_EVENTS_PER_PLAYER_WINDOW or #all >= GAME_EVENTS_PER_SERVER_WINDOW then
+  if #mine >= limit or #all >= GAME_EVENTS_PER_SERVER_WINDOW then
     return false
   end
   mine[#mine + 1] = now
   all[#all + 1] = now
+  return true
+end
+
+--- Forgets everything kept about a player (they left): their limits and their flag cooldowns.
+function Guard:forgetGamePlayer(playerKey)
+  playerKey = tostring(playerKey)
+  self.gameSpawnSent[playerKey] = nil
+  self.gameFlagSent[playerKey] = nil
+  self.tracker:forgetOwner(playerKey)
+end
+
+--- True while game events may be sent: on, not backed off, and the settings are not stale.
+function Guard:_gameActive()
+  if not self.gameEnabled then
+    return false
+  end
+  local now = self.now()
+  if now < self.gameBackoffUntil then
+    return false
+  end
+  if self.configFetchedAt and now - self.configFetchedAt > GAME_CONFIG_MAX_AGE_SECONDS then
+    return false -- we have not been able to confirm the operator still wants them
+  end
   return true
 end
 
@@ -806,7 +914,7 @@ function Guard:gameEvent(input, callback)
       callback(ok)
     end
   end
-  if not self.gameEnabled or self.now() < self.gameBackoffUntil then
+  if not self:_gameActive() then
     return done(false)
   end
   if type(input) ~= "table" or type(input.joinEventId) ~= "string" or input.joinEventId == "" then
@@ -826,7 +934,7 @@ function Guard:gameEvent(input, callback)
   else
     return done(false)
   end
-  if not self:_gameAllowance(tostring(input.playerKey)) then
+  if not self:_gameAllowance(tostring(input.playerKey), input.type) then
     return done(false)
   end
   self.http("POST", "/v1/events/game", body, function(status, responseBody)
@@ -837,10 +945,13 @@ function Guard:gameEvent(input, callback)
     self.log("debug", "could not send a game event (status " .. tostring(status) .. ")")
     if status == 429 then
       self.gameBackoffUntil = self.now() + GAME_BACKOFF_SECONDS
-    elseif status == 403 then
-      local decoded = type(responseBody) == "string" and self:_decode(responseBody) or nil
+    elseif status == 401 or status == 402 or status == 403 then
+      -- The key or the account is not usable (revoked, plan paused, no permission): stop for a while.
+      self.gameBackoffUntil = self.now() + GAME_REFUSED_BACKOFF_SECONDS
+      local decoded = status == 403 and type(responseBody) == "string" and self:_decode(responseBody) or nil
       if decoded and decoded.error == "game_events_disabled" then
-        -- Off until the next settings refresh says otherwise.
+        -- The operator switched them off: off until the next settings refresh says otherwise.
+        self.gameBackoffUntil = 0
         self:_applyGameConfig(false, nil)
       end
     end
@@ -862,13 +973,15 @@ end
 --- Takes a position sample for a player or a vehicle and sends a flag for anything the checks do not
 -- believe. `key` tells one track from another. The position is used here and goes no further.
 function Guard:samplePosition(playerKey, key, joinEventId, label, x, y, z)
-  if not self.gameEnabled or not self.gameChecks then
+  if not self.gameChecks or not self:_gameActive() then
     return
   end
   if type(x) ~= "number" or type(y) ~= "number" or type(z) ~= "number" then
     return
   end
-  for _, flag in ipairs(self.tracker:sample(key, self.clock(), x, y, z, self.gameChecks)) do
+  local flags =
+    self.tracker:sample(key, self.clock(), x, y, z, self.gameChecks, tostring(playerKey), self.coarseClock)
+  for _, flag in ipairs(flags) do
     self:gameEvent({
       playerKey = playerKey,
       joinEventId = joinEventId,

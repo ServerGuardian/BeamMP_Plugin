@@ -29,6 +29,9 @@ local settings = nil
 local joins = {} -- playerID -> eventId of the join we checked
 local vehicles = {} -- playerID -> { [vehicleID] = true }, for the movement checks (memory only)
 local SAMPLE_EVENT = "sgGameSample"
+local REFRESH_EVENT = "sgConfigRefresh"
+local REFRESH_MS = 10 * 60 * 1000 -- how often the settings are asked for again, so a server nobody joins still hears
+local SKIP_AFTER_SPAWN = 2 -- positions right after a spawn or a reset may not be right yet
 -- Only when recordKicks is on: who is here and who left in the last few seconds, so a console `kick`
 -- typed after the player is gone can still be matched. Names are held in memory only. They are never
 -- logged or sent anywhere.
@@ -181,8 +184,8 @@ local function httpForCore(method, path, body, callback)
   -- Leave events and game events are fire-and-forget; everything else waits for the answer (with a
   -- time limit). A game event can come every second for every player, and waiting for each one would
   -- hold up the whole server, so it is started in the background and counted as sent: the plugin
-  -- cannot see the answer, and relies on its own limits and the hourly settings refresh (which says if
-  -- the operator has switched game events off).
+  -- cannot see the answer, and relies on its own limits and the settings refresh every ten minutes
+  -- (which says if the operator has switched game events off, or the key no longer works).
   if path == "/v1/events/game" then
     curlRequest(method, path, body, false)
     callback(202, "")
@@ -214,6 +217,17 @@ function onInit()
     settings = nil
     return
   end
+  -- The movement checks need a clock finer than a second. MP.CreateTimer() is a stopwatch with
+  -- microsecond resolution (BeamMP-Server, TLuaEngine.cpp), so use it when there is one.
+  local clock = nil
+  if type(MP.CreateTimer) == "function" then
+    local made, stopwatch = pcall(MP.CreateTimer)
+    if made and type(stopwatch) == "table" and type(stopwatch.GetCurrent) == "function" then
+      clock = function()
+        return stopwatch:GetCurrent()
+      end
+    end
+  end
   guard = ServerGuardianCore.new({
     apiBase = settings.base,
     failMode = settings.failMode,
@@ -221,6 +235,7 @@ function onInit()
     json = { encode = Util.JsonEncode, decode = Util.JsonDecode },
     log = log,
     prefix = "bm",
+    clock = clock,
   })
   -- Game events are off until ServerGuardian says otherwise. The sampling timer exists only while
   -- they are on, and is moved or removed whenever a settings refresh changes that.
@@ -230,9 +245,18 @@ function onInit()
       MP.CreateEventTimer(SAMPLE_EVENT, math.max(250, math.floor(checks.sampleSeconds * 1000)))
     end
   end
+  -- The settings are asked for again every ten minutes whether or not anyone joins, so a server
+  -- with nobody on it still learns that game events were switched off (or on).
+  MP.CreateEventTimer(REFRESH_EVENT, REFRESH_MS)
   guard:refreshConfig(function(ok)
     log("info", ok and "started" or "started with the built-in wording (could not reach the API)")
   end, true)
+end
+
+function sgConfigRefresh()
+  if guard then
+    guard:refreshConfig(nil, true)
+  end
 end
 
 -- Splits long text for the chat box, on spaces.
@@ -317,7 +341,8 @@ function onPlayerDisconnect(playerID)
     for vehicleID in pairs(vehicles[playerID] or {}) do
       guard.tracker:forget(playerID .. ":" .. vehicleID)
     end
-    guard.gamePlayerSent[tostring(playerID)] = nil
+    -- Their limits and flag cooldowns go with them, so an id BeamMP gives to someone new is clean.
+    guard:forgetGamePlayer(playerID)
     -- Forgotten, so an id BeamMP gives to someone new starts with no history.
     local key = tostring(playerID)
     guard.reportPending[key] = nil
@@ -599,18 +624,24 @@ local function playerName(playerID)
   return type(names) == "table" and names[playerID] or nil
 end
 
+-- onVehicleSpawn is also run by other plugins, one of which may cancel the spawn afterwards; this
+-- plugin cannot tell, so a cancelled spawn is still reported (and tracked until the vehicle is deleted).
 function onVehicleSpawn(playerID, vehicleID, data)
   vehicles[playerID] = vehicles[playerID] or {}
   vehicles[playerID][vehicleID] = true
+  if guard then
+    guard.tracker:start(playerID .. ":" .. vehicleID, SKIP_AFTER_SPAWN)
+  end
   if guard and guard.gameEnabled and joins[playerID] then
     guard:spawn(tostring(playerID), joins[playerID], playerName(playerID), vehicleModel(data))
   end
 end
 
--- A reset moves the vehicle (that is what it is for), so the next position starts the track again.
+-- A reset moves the vehicle (that is what it is for), so the track starts again, after a couple of
+-- samples that may still hold the old position.
 function onVehicleReset(playerID, vehicleID)
   if guard then
-    guard.tracker:reset(playerID .. ":" .. vehicleID)
+    guard.tracker:reset(playerID .. ":" .. vehicleID, SKIP_AFTER_SPAWN)
   end
 end
 
@@ -636,7 +667,11 @@ function sgGameSample()
       for vehicleID in pairs(list) do
         local position, problem = MP.GetPositionRaw(playerID, vehicleID)
         local at = type(position) == "table" and type(position.pos) == "table" and position.pos or nil
-        if at and (problem == nil or problem == "") then
+        -- A position of nothing, or of exactly zero, is a vehicle that has no position yet.
+        local usable = at
+          and type(at[1]) == "number" and type(at[2]) == "number" and type(at[3]) == "number"
+          and not (at[1] == 0 and at[2] == 0 and at[3] == 0)
+        if usable and (problem == nil or problem == "") then
           guard:samplePosition(
             tostring(playerID),
             playerID .. ":" .. vehicleID,
@@ -657,6 +692,7 @@ MP.RegisterEvent("onVehicleSpawn", "onVehicleSpawn")
 MP.RegisterEvent("onVehicleReset", "onVehicleReset")
 MP.RegisterEvent("onVehicleDeleted", "onVehicleDeleted")
 MP.RegisterEvent(SAMPLE_EVENT, "sgGameSample")
+MP.RegisterEvent(REFRESH_EVENT, "sgConfigRefresh")
 MP.RegisterEvent("onPlayerJoin", "onPlayerJoin")
 MP.RegisterEvent("onPlayerDisconnect", "onPlayerDisconnect")
 MP.RegisterEvent("onConsoleInput", "onConsoleInput")
