@@ -34,6 +34,9 @@ This server's behaviour is set in **`config.json`, in the `settings` object**, n
 
 On join the plugin shows the ServerGuardian notice, sends the player's BeamMP account id and IP address (and, if they agree to the optional hardware check, a hardware token) and removes the player if the answer is "block". Nothing a player controls reaches a shell command, and the key is never logged. When a player leaves, the plugin says so.
 
+
+**Heartbeat.** About once a minute (and once at start-up) the plugin tells ServerGuardian it is there and how many players are on, so the portal can show the server as online or offline. The count is the only thing sent, it is never logged, and it runs whether or not game events or reports are on. BeamMP waits for the answer (with the usual time limit), at most one at a time. A refused key, plan or permission pauses it for ten minutes, too many requests for one.
+
 ## Recording bans and kicks
 
 BeamMP-Server has no ban system of its own (only a console `kick`), so ServerGuardian has nothing to match against unless bans are recorded. The plugin adds three console commands for that. Type them in the server console:

@@ -17,12 +17,14 @@
 --     platform's config file; they are sent to the API as five yes/no or open/closed values and nothing
 --     else, and only those the file actually sets (a missing one is never sent, so an older config
 --     file cannot reset what the server had);
+--   * the heartbeat (about once a minute, so the portal can show the server online or offline) carries
+--     one whole number, how many players are on, and nothing else;
 --   * a blocked player is told only the fixed wording from the API, never why.
 
 ServerGuardianCore = ServerGuardianCore or {}
 local M = ServerGuardianCore
 
-M.VERSION = "0.6.0"
+M.VERSION = "0.7.0"
 
 -- Used until the API has been reached once, and whenever it cannot be. Kept short on purpose: the
 -- authoritative wording comes from GET /v1/mod/config so operators cannot change it.
@@ -86,6 +88,13 @@ local GAME_EVENT_WINDOW_SECONDS = 60
 local GAME_EVENTS_PER_SERVER_WINDOW = 400
 local GAME_BACKOFF_SECONDS = 60 -- after a 429
 local GAME_REFUSED_BACKOFF_SECONDS = 600 -- after a 401, 402 or 403: the key or the account is not usable
+-- The heartbeat is sent about once a minute by the platform's timer. Never twice within 55 seconds
+-- (whole-second clocks wobble by one), and a refusal pauses it like the other calls.
+M.HEARTBEAT_SECONDS = 60
+local HEARTBEAT_MIN_SECONDS = 55
+local HEARTBEAT_BACKOFF_SECONDS = 60
+local HEARTBEAT_REFUSED_BACKOFF_SECONDS = 600
+local MAX_HEARTBEAT_PLAYERS = 100000
 local GAME_CONFIG_MAX_AGE_SECONDS = 10800 -- game events switch themselves off if settings cannot be refreshed for this long
 local MIN_SAMPLE_SECONDS = 1
 local MAX_SAMPLE_SECONDS = 10
@@ -349,6 +358,9 @@ function M.new(opts)
   self.gameEnabled = false -- on only when the config file or the API says so; absent means off
   self.gameChecks = nil
   self.gameBackoffUntil = 0
+  self.heartbeatInFlight = false
+  self.heartbeatBackoffUntil = 0
+  self.heartbeatLastAt = nil
   self.gameSpawnSent = {} -- player key -> list of times a spawn was sent
   self.gameFlagSent = {} -- player key -> list of times a flag was sent
   self.gameServerSent = {} -- times of every game event sent, for the whole server
@@ -358,6 +370,52 @@ function M.new(opts)
   self.counter = 0
   self.stats = { checks = 0, passes = 0, blocks = 0, errors = 0, skipped = 0 }
   return self
+end
+
+--- Tells the API the server is there, with how many players are on (a whole number, or nothing).
+-- Called by the platform's timer about every minute, and once at start-up. Only one is ever in
+-- flight, none is sent within 55 seconds of the last, and a refusal pauses it: ten minutes for a
+-- revoked key, a paused plan or a missing permission (401, 402, any 403), one minute for 429. Any other
+-- failure is simply tried again at the next tick. Works whether or not game events or reports are on.
+-- Nothing but the count is sent, and it is never logged. callback (optional) receives true on success.
+function Guard:heartbeat(players, callback)
+  local function done(ok)
+    if callback then
+      callback(ok)
+    end
+  end
+  local now = self.clock() -- a steady clock, not wall time, so it only ever measures gaps
+  if self.heartbeatInFlight or now < self.heartbeatBackoffUntil then
+    return done(false)
+  end
+  if self.heartbeatLastAt and now - self.heartbeatLastAt < HEARTBEAT_MIN_SECONDS then
+    return done(false)
+  end
+  local body = {}
+  if
+    type(players) == "number"
+    and players >= 0
+    and players <= MAX_HEARTBEAT_PLAYERS
+    and players == math.floor(players)
+  then
+    body.players = math.floor(players)
+  end
+  self.heartbeatInFlight = true
+  self.heartbeatLastAt = now
+  self.http("POST", "/v1/mod/heartbeat", body, function(status)
+    self.heartbeatInFlight = false
+    if status == 204 then
+      return done(true)
+    end
+    -- Only the status is logged.
+    self.log("debug", "could not send the heartbeat (status " .. tostring(status) .. ")")
+    if status == 429 then
+      self.heartbeatBackoffUntil = self.clock() + HEARTBEAT_BACKOFF_SECONDS
+    elseif status == 401 or status == 402 or status == 403 then
+      self.heartbeatBackoffUntil = self.clock() + HEARTBEAT_REFUSED_BACKOFF_SECONDS
+    end
+    done(false)
+  end)
 end
 
 --- A new id for one join. Unique enough for idempotency: time, a counter and a random part.

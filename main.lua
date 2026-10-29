@@ -30,6 +30,7 @@ local joins = {} -- playerID -> eventId of the join we checked
 local vehicles = {} -- playerID -> { [vehicleID] = true }, for the movement checks (memory only)
 local SAMPLE_EVENT = "sgGameSample"
 local REFRESH_EVENT = "sgConfigRefresh"
+local HEARTBEAT_EVENT = "sgHeartbeat"
 local REFRESH_MS = 10 * 60 * 1000 -- how often the settings are asked for again, so a server nobody joins still hears
 local SKIP_AFTER_SPAWN = 2 -- positions right after a spawn or a reset may not be right yet
 -- Only when recordKicks is on: who is here and who left in the last few seconds, so a console `kick`
@@ -254,9 +255,32 @@ function onInit()
   -- The settings are asked for again every ten minutes whether or not anyone joins, so a server
   -- with nobody on it still learns that game events were switched off (or on).
   MP.CreateEventTimer(REFRESH_EVENT, REFRESH_MS)
+  -- About once a minute the plugin says it is there, with how many players are on, so the portal can
+  -- show the server online or offline. It runs whether or not game events or reports are on.
+  MP.CreateEventTimer(HEARTBEAT_EVENT, ServerGuardianCore.HEARTBEAT_SECONDS * 1000)
   guard:refreshConfig(function(ok)
     log("info", ok and "started" or "started with the built-in wording (could not reach the API)")
+    sgHeartbeat()
   end, true)
+end
+
+-- How many players are connected: only the number is used, and it is never logged.
+local function playerCount()
+  local ok, names = pcall(MP.GetPlayers)
+  if not ok or type(names) ~= "table" then
+    return nil
+  end
+  local count = 0
+  for _ in pairs(names) do
+    count = count + 1
+  end
+  return count
+end
+
+function sgHeartbeat()
+  if guard then
+    guard:heartbeat(playerCount())
+  end
 end
 
 function sgConfigRefresh()
@@ -699,6 +723,7 @@ MP.RegisterEvent("onVehicleReset", "onVehicleReset")
 MP.RegisterEvent("onVehicleDeleted", "onVehicleDeleted")
 MP.RegisterEvent(SAMPLE_EVENT, "sgGameSample")
 MP.RegisterEvent(REFRESH_EVENT, "sgConfigRefresh")
+MP.RegisterEvent(HEARTBEAT_EVENT, "sgHeartbeat")
 MP.RegisterEvent("onPlayerJoin", "onPlayerJoin")
 MP.RegisterEvent("onPlayerDisconnect", "onPlayerDisconnect")
 MP.RegisterEvent("onConsoleInput", "onConsoleInput")
