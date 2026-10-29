@@ -10,9 +10,11 @@
 --     hardware id unless the player explicitly said yes;
 --   * a player report carries a category, an optional short note the player typed, and the platform ids
 --     of the two players: never chat, a name (beyond the operator's own reference), or an address;
---   * a game event (a spawn, or a movement flag) carries the id of the player's join, a short label,
---     and either an item name or the kind of check: never a position, a coordinate, chat, an address
---     or a platform id. The movement checks run here, on the game server, and send only a flag;
+--   * a game event (a spawn, an edit or a remove of a vehicle, or a movement flag) carries the id of
+--     the player's join, a short label, and either an item name or the kind of check: never a position,
+--     a coordinate, chat, an address or a platform id. The movement checks run here, on the game
+--     server, and send only a flag. Events are held for a few seconds and sent in groups; a group is
+--     only a list of those same events;
 --   * the server's settings (fail mode, game events, reports, shared bans, youth-oriented) are set in the
 --     platform's config file; they are sent to the API as five yes/no or open/closed values and nothing
 --     else, and only those the file actually sets (a missing one is never sent, so an older config
@@ -24,7 +26,7 @@
 ServerGuardianCore = ServerGuardianCore or {}
 local M = ServerGuardianCore
 
-M.VERSION = "0.7.0"
+M.VERSION = "0.8.0"
 
 -- Used until the API has been reached once, and whenever it cannot be. Kept short on purpose: the
 -- authoritative wording comes from GET /v1/mod/config so operators cannot change it.
@@ -82,12 +84,37 @@ local REPORT_WINDOW_SECONDS = 600
 
 -- Game events (decision D41, group 2). The API's own limit is 600 events a minute per key, so a
 -- player is held to far less, and the whole server to a little under that.
-local GAME_SPAWNS_PER_PLAYER_WINDOW = 20 -- spawns and flags have a limit each, so spam of one cannot starve the other
+local GAME_SPAWNS_PER_PLAYER_WINDOW = 20 -- every kind has a limit of its own, so spam of one cannot starve another
+local GAME_EDITS_PER_PLAYER_WINDOW = 20
+local GAME_REMOVES_PER_PLAYER_WINDOW = 20
 local GAME_FLAGS_PER_PLAYER_WINDOW = 10
+local GAME_PLAYER_LIMITS = {
+  spawn = GAME_SPAWNS_PER_PLAYER_WINDOW,
+  edit = GAME_EDITS_PER_PLAYER_WINDOW,
+  remove = GAME_REMOVES_PER_PLAYER_WINDOW,
+  flag = GAME_FLAGS_PER_PLAYER_WINDOW,
+}
+-- Edits and removes are only sent to a server that lists them in its `gameEvents.events`: an older
+-- server's strict schema would refuse them. Spawns and flags have always been accepted.
+local GAME_ALWAYS_KINDS = { spawn = true, flag = true }
+local GAME_OPTIONAL_KINDS = { edit = true, remove = true }
 local GAME_EVENT_WINDOW_SECONDS = 60
 local GAME_EVENTS_PER_SERVER_WINDOW = 400
 local GAME_BACKOFF_SECONDS = 60 -- after a 429
 local GAME_REFUSED_BACKOFF_SECONDS = 600 -- after a 401, 402 or 403: the key or the account is not usable
+-- Batching (decision D43). The API says how many events may go in one request and how long to hold
+-- them (`gameEvents.batch`); these are the bounds the mod keeps whatever it says. The platform calls
+-- Guard:tick() about every GAME_TICK_SECONDS, from a timer of its own like the heartbeat's.
+M.GAME_TICK_SECONDS = 1
+local MAX_BATCH_EVENTS = 100 -- the API's own limit for one request
+local MIN_FLUSH_SECONDS = 1 -- the tick is about once a second, so nothing finer means anything
+local MAX_FLUSH_SECONDS = 60
+local GAME_QUEUE_CAP = 500 -- events held at most (while the API is slow, down or says wait); the oldest go first
+local GAME_QUEUE_MAX_AGE_SECONDS = 600 -- an event this old is dropped, not sent: it would show with the wrong time
+local GAME_RETRY_FIRST_SECONDS = 5 -- after a 5xx or no answer; doubles each time up to the next
+local GAME_RETRY_MAX_SECONDS = 60
+local GAME_HOLD_MAX_SECONDS = 600 -- the longest a Retry-After is believed
+local GAME_REJECT_LOG_SECONDS = 60 -- a rejection is logged once in this long, so a mismatch cannot fill the log
 -- The heartbeat is sent about once a minute by the platform's timer. Never twice within 55 seconds
 -- (whole-second clocks wobble by one), and a refusal pauses it like the other calls.
 M.HEARTBEAT_SECONDS = 60
@@ -361,9 +388,17 @@ function M.new(opts)
   self.heartbeatInFlight = false
   self.heartbeatBackoffUntil = 0
   self.heartbeatLastAt = nil
-  self.gameSpawnSent = {} -- player key -> list of times a spawn was sent
-  self.gameFlagSent = {} -- player key -> list of times a flag was sent
+  -- kind ("spawn", "edit", "remove" or "flag") -> player key -> list of times one was sent
+  self.gameSent = { spawn = {}, edit = {}, remove = {}, flag = {} }
   self.gameServerSent = {} -- times of every game event sent, for the whole server
+  self.gameBatch = nil -- { maxEvents, flushSeconds } while the API serves batching; nil means one request per event
+  self.gameKinds = nil -- the kinds the API lists in `gameEvents.events`, as a set (nil when it lists none)
+  self.gameQueue = {} -- events waiting to be sent, oldest first: { body = the event, at = self.clock() }
+  self.gameBatchInFlight = false
+  self.gameHoldUntil = 0 -- self.clock() time before which no batch is sent (a 429, or waiting to retry)
+  self.gameRetryFails = 0 -- failures in a row, for the retry delay
+  self.gameDropped = 0 -- events dropped since the last debug line about it
+  self.gameRejectLoggedAt = nil
   self.tracker = M.newTracker()
   self.onGameConfig = nil -- set by the platform: called when game events are switched on or off
   self.configFetchedAt = nil
@@ -514,10 +549,13 @@ function Guard:_fetchConfig(now, callback)
         }
         local gameSettings = decoded.gameEvents
         if self.localSettings.gameEvents ~= nil then
-          -- The file decides whether they are on; the limits for the checks still come from the API.
+          -- The file decides whether they are on; the limits for the checks, and how to batch, still come from the API.
+          local served = type(decoded.gameEvents) == "table" and decoded.gameEvents or {}
           gameSettings = {
             enabled = self.localSettings.gameEvents,
-            checks = type(decoded.gameEvents) == "table" and decoded.gameEvents.checks or nil,
+            checks = served.checks,
+            batch = served.batch,
+            events = served.events,
           }
         end
         self:_setGameConfig(gameSettings)
@@ -542,6 +580,32 @@ end
 --- True if every number is finite and above zero.
 local function positive(value)
   return type(value) == "number" and value == value and value > 0 and value < math.huge
+end
+
+--- How to batch, from `gameEvents.batch`: { maxEvents, flushSeconds }, held to what this file can do.
+-- nil when the API does not say (an older server) or says something unusable: events then go one by one.
+local function readBatch(value)
+  if type(value) ~= "table" or not positive(value.maxEvents) or not positive(value.flushSeconds) then
+    return nil
+  end
+  return {
+    maxEvents = math.min(MAX_BATCH_EVENTS, math.max(1, math.floor(value.maxEvents))),
+    flushSeconds = math.min(MAX_FLUSH_SECONDS, math.max(MIN_FLUSH_SECONDS, value.flushSeconds)),
+  }
+end
+
+--- The kinds of event the API lists in `gameEvents.events`, as a set of the ones this file knows.
+local function readKinds(value)
+  if type(value) ~= "table" then
+    return nil
+  end
+  local kinds = {}
+  for _, kind in ipairs(value) do
+    if GAME_PLAYER_LIMITS[kind] then
+      kinds[kind] = true
+    end
+  end
+  return kinds
 end
 
 --- Reads the `gameEvents` part of the settings: off unless it says `enabled: true` with the numbers the
@@ -574,23 +638,29 @@ function Guard:_setGameConfig(settings)
   elseif settings.checks ~= nil then
     self.log("warn", "the movement-check settings from ServerGuardian were not usable, so the checks are off")
   end
-  self:_applyGameConfig(true, checks)
+  self:_applyGameConfig(true, checks, readBatch(settings.batch), readKinds(settings.events))
 end
 
-function Guard:_applyGameConfig(enabled, checks)
+function Guard:_applyGameConfig(enabled, checks, batch, kinds)
   local oldChecks = self.gameChecks
   local changed = enabled ~= self.gameEnabled
     or (oldChecks == nil) ~= (checks == nil)
     or (oldChecks ~= nil and checks ~= nil and oldChecks.sampleSeconds ~= checks.sampleSeconds)
   self.gameEnabled = enabled
   self.gameChecks = checks
+  self.gameBatch = enabled and batch or nil
+  self.gameKinds = enabled and kinds or nil
   if not checks then
     self.tracker = M.newTracker() -- nothing is kept while the checks are off
   end
   if not enabled then
-    self.gameSpawnSent = {}
-    self.gameFlagSent = {}
+    self.gameSent = { spawn = {}, edit = {}, remove = {}, flag = {} }
     self.gameServerSent = {}
+  end
+  if not self.gameBatch then
+    -- Off, or an API that does not batch: nothing is held. (Waiting events are not sent anywhere
+    -- else: an API that does not batch may not have the route.)
+    self.gameQueue = {}
   end
   if changed and self.onGameConfig then
     self.onGameConfig(enabled, checks)
@@ -1004,7 +1074,7 @@ function Guard:_categoryList()
 end
 
 -- ---------------------------------------------------------------------------------------------------
--- Game events (decision D41, group 2): spawns, and flags from the movement checks.
+-- Game events (decision D41, group 2; D43): spawns, edits and removes, and flags from the movement checks.
 -- ---------------------------------------------------------------------------------------------------
 
 --- The id of a game event. Opaque, and unique for this server.
@@ -1013,9 +1083,9 @@ function Guard:_gameEventId()
   return string.format("ev-%s-%x-%x", self.prefix, self.now(), self.counter)
 end
 
---- True when this player may have another event of this kind ("spawn" or "flag") sent now, counting
--- it if so. Keeps the server well inside the API's own limit, and one busy player from using it all;
--- spawns and flags are counted separately so spam of one does not hide the other.
+--- True when this player may have another event of this kind ("spawn", "edit", "remove" or "flag")
+-- sent now, counting it if so. Keeps the server well inside the API's own limit, and one busy player
+-- from using it all; each kind is counted separately so spam of one does not hide another.
 function Guard:_gameAllowance(playerKey, kind)
   local now = self.now()
   local function recent(list)
@@ -1027,8 +1097,8 @@ function Guard:_gameAllowance(playerKey, kind)
     end
     return kept
   end
-  local sent = kind == "flag" and self.gameFlagSent or self.gameSpawnSent
-  local limit = kind == "flag" and GAME_FLAGS_PER_PLAYER_WINDOW or GAME_SPAWNS_PER_PLAYER_WINDOW
+  local sent = self.gameSent[kind]
+  local limit = GAME_PLAYER_LIMITS[kind]
   local mine = recent(sent[playerKey] or {})
   local all = recent(self.gameServerSent)
   sent[playerKey] = mine
@@ -1041,11 +1111,13 @@ function Guard:_gameAllowance(playerKey, kind)
   return true
 end
 
---- Forgets everything kept about a player (they left): their limits and their flag cooldowns.
+--- Forgets everything kept about a player (they left): their limits and their flag cooldowns. Events
+-- of theirs that are already waiting to be sent still go: they carry the join's reference, not the player.
 function Guard:forgetGamePlayer(playerKey)
   playerKey = tostring(playerKey)
-  self.gameSpawnSent[playerKey] = nil
-  self.gameFlagSent[playerKey] = nil
+  for _, sent in pairs(self.gameSent) do
+    sent[playerKey] = nil
+  end
   self.tracker:forgetOwner(playerKey)
 end
 
@@ -1064,11 +1136,28 @@ function Guard:_gameActive()
   return true
 end
 
+--- A header from the platform's answer, whatever the case it came in. Platforms that cannot give
+-- headers pass none.
+local function headerOf(headers, name)
+  if type(headers) ~= "table" then
+    return nil
+  end
+  for key, value in pairs(headers) do
+    if type(key) == "string" and key:lower() == name then
+      return value
+    end
+  end
+  return nil
+end
+
 --- Sends one game event. `body` has the type's own fields; the id, the join reference and the label
 -- are added here. Nothing is sent while game events are off or backed off, for a player with no join
--- reference, or past the limits. Quiet on every failure: nothing depends on it.
--- input: { playerKey, joinEventId, label (optional), type = "spawn" | "flag", item | check + severity }
--- callback (optional) receives true when the API accepted it.
+-- reference, or past the limits. Quiet on every failure: nothing depends on it. When the API serves
+-- batching the event is held and sent with others (see Guard:tick); otherwise it is sent at once.
+-- input: { playerKey, joinEventId, label (optional), type = "spawn" | "edit" | "remove" | "flag",
+--          item | check + severity }
+-- callback (optional) receives true when the event was accepted: by the API, or, when it is batched,
+-- for sending (what happens to it after that is not reported back).
 function Guard:gameEvent(input, callback)
   local function done(ok)
     if callback then
@@ -1081,22 +1170,31 @@ function Guard:gameEvent(input, callback)
   if type(input) ~= "table" or type(input.joinEventId) ~= "string" or input.joinEventId == "" then
     return done(false)
   end
+  local kind = input.type
+  if not GAME_PLAYER_LIMITS[kind] then
+    return done(false)
+  end
+  if GAME_OPTIONAL_KINDS[kind] and not (self.gameKinds and self.gameKinds[kind]) then
+    return done(false) -- this API has not said it takes edits and removes
+  end
   local body = {
     eventId = self:_gameEventId(),
     joinEventId = input.joinEventId,
-    type = input.type,
+    type = kind,
     label = gameText(input.label, MAX_LABEL),
   }
-  if input.type == "spawn" then
-    body.item = gameText(input.item, MAX_ITEM) or "vehicle"
-  elseif input.type == "flag" then
+  if kind == "flag" then
     body.check = input.check
     body.severity = input.severity
   else
+    body.item = gameText(input.item, MAX_ITEM) or "vehicle"
+  end
+  if not self:_gameAllowance(tostring(input.playerKey), kind) then
     return done(false)
   end
-  if not self:_gameAllowance(tostring(input.playerKey), input.type) then
-    return done(false)
+  if self.gameBatch then
+    self:_queueGameEvent(body)
+    return done(true)
   end
   self.http("POST", "/v1/events/game", body, function(status, responseBody)
     if status == 202 then
@@ -1120,6 +1218,228 @@ function Guard:gameEvent(input, callback)
   end)
 end
 
+-- ---------------------------------------------------------------------------------------------------
+-- Batching (decision D43). Events wait here, in memory only, until there are `maxEvents` of them or the
+-- oldest has waited `flushSeconds`, and then go in one POST /v1/events/batch. The queue is bounded, and
+-- nothing in this part ever blocks the game or raises an error into it.
+-- ---------------------------------------------------------------------------------------------------
+
+--- Logs how many events were dropped (the queue was full, or they had waited too long) since the last
+-- time, from the tick, so at most once a second. A count only, and only at debug level.
+function Guard:_reportDrops()
+  if self.gameDropped > 0 then
+    self.log("debug", "dropped " .. self.gameDropped .. " waiting game events (the queue was full or they were too old)")
+    self.gameDropped = 0
+  end
+end
+
+--- Keeps the queue within its cap by dropping the oldest events.
+function Guard:_trimQueue()
+  local over = #self.gameQueue - GAME_QUEUE_CAP
+  if over > 0 then
+    self.gameQueue = table.move(self.gameQueue, over + 1, #self.gameQueue, 1, {})
+    self.gameDropped = self.gameDropped + over
+  end
+end
+
+--- Drops events that have waited so long that sending them would date them wrongly (the API stamps an
+-- event with the time it arrives).
+function Guard:_dropStale()
+  local queue = self.gameQueue
+  local now = self.clock()
+  local stale = 0
+  while queue[stale + 1] and now - queue[stale + 1].at > GAME_QUEUE_MAX_AGE_SECONDS do
+    stale = stale + 1
+  end
+  if stale > 0 then
+    self.gameQueue = table.move(queue, stale + 1, #queue, 1, {})
+    self.gameDropped = self.gameDropped + stale
+  end
+end
+
+function Guard:_queueGameEvent(body)
+  self:_dropStale() -- so a full batch means a full batch of events worth sending
+  self.gameQueue[#self.gameQueue + 1] = { body = body, at = self.clock() }
+  self:_trimQueue()
+  if #self.gameQueue >= self.gameBatch.maxEvents then
+    self:_flushGame()
+  end
+end
+
+--- Puts events that were not delivered back at the front, in order, and trims.
+function Guard:_requeue(entries)
+  if #entries == 0 then
+    return
+  end
+  local merged = table.move(entries, 1, #entries, 1, {})
+  self.gameQueue = table.move(self.gameQueue, 1, #self.gameQueue, #merged + 1, merged)
+  self:_trimQueue()
+end
+
+--- Waits before the next batch: for a 429, as long as the API said (Retry-After), else a minute; for a
+-- 5xx or no answer, a few seconds and then longer, up to a minute.
+function Guard:_holdGame(seconds)
+  self.gameHoldUntil = self.clock() + seconds
+end
+
+--- What the API refused, as field names only (never a value). The names are cut to plain identifiers.
+local function rejectedFields(rejected)
+  local names, seen = {}, {}
+  if type(rejected) == "table" then
+    for _, entry in ipairs(rejected) do
+      for _, field in ipairs(type(entry) == "table" and type(entry.fields) == "table" and entry.fields or {}) do
+        local name = type(field) == "string" and field:match("^[%w_%.]+") or nil
+        if name and not seen[name] and #names < 8 then
+          seen[name] = true
+          names[#names + 1] = name
+        end
+      end
+    end
+  end
+  return names
+end
+
+--- Sends up to `maxEvents` of the waiting events in one request, if one is not already on its way and
+-- the API has not asked us to wait. Called when the queue is full, by the tick when the oldest event
+-- has waited long enough, and when the platform is shutting down.
+function Guard:_flushGame()
+  local batch = self.gameBatch
+  if not batch or self.gameBatchInFlight or #self.gameQueue == 0 then
+    return
+  end
+  if not self:_gameActive() then
+    self.gameQueue = {} -- off, backed off or stale: what is waiting is not sent later
+    return
+  end
+  if self.clock() < self.gameHoldUntil then
+    return
+  end
+  self:_dropStale()
+  local count = math.min(#self.gameQueue, batch.maxEvents)
+  if count == 0 then
+    return
+  end
+  local taken = table.move(self.gameQueue, 1, count, 1, {})
+  self.gameQueue = table.move(self.gameQueue, count + 1, #self.gameQueue, 1, {})
+  local events = {}
+  for i, entry in ipairs(taken) do
+    events[i] = entry.body
+  end
+  self.gameBatchInFlight = true
+  local ok = pcall(self.http, "POST", "/v1/events/batch", { events = events }, function(status, responseBody, headers)
+    self.gameBatchInFlight = false
+    self:_batchAnswered(taken, status, responseBody, headers)
+  end)
+  if not ok then
+    -- The platform could not even start the request: keep the events and try again later.
+    self.gameBatchInFlight = false
+    self:_requeue(taken)
+    self:_holdGame(GAME_RETRY_FIRST_SECONDS)
+  end
+end
+
+--- What to do with a batch once the API has answered (or not). `taken` is what was sent.
+function Guard:_batchAnswered(taken, status, responseBody, headers)
+  if status == 202 then
+    self.gameRetryFails = 0
+    local decoded = type(responseBody) == "string" and responseBody ~= "" and self:_decode(responseBody) or nil
+    local fields = decoded and rejectedFields(decoded.rejected) or {}
+    if #fields > 0 then
+      self:_logRejected(fields)
+    end
+    -- Whatever was rejected is dropped: it would be refused again. If a full batch has built up while
+    -- this one was on its way, it goes now.
+    local batch = self.gameBatch
+    if batch and #self.gameQueue >= batch.maxEvents then
+      self:_flushGame()
+    end
+    return
+  end
+  -- Only the status is logged: never an item, a label or an id.
+  self.log("debug", "could not send game events (status " .. tostring(status) .. ")")
+  if status == 429 then
+    self:_requeue(taken)
+    local wait = tonumber(headerOf(headers, "retry-after"))
+    if not positive(wait) then
+      wait = GAME_BACKOFF_SECONDS
+    end
+    self:_holdGame(math.min(GAME_HOLD_MAX_SECONDS, wait))
+  elseif status == 422 then
+    local decoded = type(responseBody) == "string" and self:_decode(responseBody) or nil
+    local rejected = decoded and type(decoded.rejected) == "table" and decoded.rejected or {}
+    local refused = {}
+    for _, entry in ipairs(rejected) do
+      if type(entry) == "table" and type(entry.index) == "number" then
+        refused[entry.index + 1] = true -- the API counts from zero
+      end
+    end
+    local fields = rejectedFields(rejected)
+    self:_logRejected(fields)
+    -- Drop only what the API named. If it named none of them (or all), they are all dropped: sending
+    -- them again would be refused again.
+    local kept = {}
+    for i, entry in ipairs(taken) do
+      if not refused[i] then
+        kept[#kept + 1] = entry
+      end
+    end
+    if #kept < #taken and #kept > 0 then
+      self:_requeue(kept)
+    end
+  elseif status == 401 or status == 402 or status == 403 then
+    -- The key or the account is not usable: stop for a while, and what is waiting is not sent later.
+    self.gameBackoffUntil = self.now() + GAME_REFUSED_BACKOFF_SECONDS
+    self.gameQueue = {}
+    local decoded = status == 403 and type(responseBody) == "string" and self:_decode(responseBody) or nil
+    if decoded and decoded.error == "game_events_disabled" then
+      -- The operator switched them off: off until the next settings refresh says otherwise.
+      self.gameBackoffUntil = 0
+      self:_applyGameConfig(false, nil)
+    end
+  elseif status == nil or status >= 500 then
+    -- No answer, or the API is struggling: keep them and try again, a little longer each time.
+    self:_requeue(taken)
+    local wait = math.min(GAME_RETRY_MAX_SECONDS, GAME_RETRY_FIRST_SECONDS * 2 ^ self.gameRetryFails)
+    self.gameRetryFails = self.gameRetryFails + 1
+    self:_holdGame(wait)
+  end
+  -- Any other answer (a 400, 404, 413 ...) is not going to change by trying again: dropped, as a
+  -- single event would be.
+end
+
+--- Logs that the API refused some events, with the names of the fields (never what was in them), once in
+-- a while.
+function Guard:_logRejected(fields)
+  local now = self.clock()
+  if self.gameRejectLoggedAt and now - self.gameRejectLoggedAt < GAME_REJECT_LOG_SECONDS then
+    return
+  end
+  self.gameRejectLoggedAt = now
+  self.log("warn", "ServerGuardian refused some game events (fields: " .. (#fields > 0 and table.concat(fields, ", ") or "unknown") .. ")")
+end
+
+--- Called by the platform's timer about every second (GAME_TICK_SECONDS): sends what is waiting once
+-- the oldest event has waited `flushSeconds`, or the queue holds a full batch. Does nothing when game
+-- events are off, not batched, or nothing is waiting.
+function Guard:tick()
+  self:_dropStale()
+  self:_reportDrops()
+  local batch = self.gameBatch
+  local oldest = self.gameQueue[1]
+  if not batch or not oldest then
+    return
+  end
+  if #self.gameQueue >= batch.maxEvents or self.clock() - oldest.at >= batch.flushSeconds then
+    self:_flushGame()
+  end
+end
+
+--- Sends what is waiting now (up to one batch), whatever its age: for when the platform is stopping.
+-- Best effort, and the answer is not waited for.
+function Guard:flushGameEvents()
+  self:_flushGame()
+end
+
 --- A player spawned something (`item` is its short name). Sent only if game events are on.
 function Guard:spawn(playerKey, joinEventId, label, item)
   self:gameEvent({
@@ -1127,6 +1447,29 @@ function Guard:spawn(playerKey, joinEventId, label, item)
     joinEventId = joinEventId,
     label = label,
     type = "spawn",
+    item = item,
+  })
+end
+
+--- A player changed something they had spawned (a vehicle's parts or paint). Sent only if game events
+-- are on, and only to an API that lists "edit" among the kinds it takes.
+function Guard:edit(playerKey, joinEventId, label, item)
+  self:gameEvent({
+    playerKey = playerKey,
+    joinEventId = joinEventId,
+    label = label,
+    type = "edit",
+    item = item,
+  })
+end
+
+--- A player's vehicle or item is gone (they deleted it). Same conditions as Guard:edit, for "remove".
+function Guard:remove(playerKey, joinEventId, label, item)
+  self:gameEvent({
+    playerKey = playerKey,
+    joinEventId = joinEventId,
+    label = label,
+    type = "remove",
     item = item,
   })
 end

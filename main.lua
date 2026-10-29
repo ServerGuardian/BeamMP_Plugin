@@ -13,9 +13,10 @@
 -- ServerGuardian and never shown to other players.
 --
 -- When the server owner turns game events on in the portal, the plugin also tells ServerGuardian when
--- a player spawns a vehicle (its model name), and runs a few movement checks on the server (a speed
--- or a jump the game could not produce) and sends only a flag when one fails. Positions never leave
--- the server. A flag is a prompt for a person to look: nothing is ever kicked or banned because of it.
+-- a player spawns, edits or deletes a vehicle (its model name), and runs a few movement checks on the
+-- server (a speed or a jump the game could not produce) and sends only a flag when one fails. Events
+-- are held for a few seconds and sent together. Positions never leave the server. A flag is a prompt
+-- for a person to look: nothing is ever kicked or banned because of it.
 --
 -- BeamMP's Lua has no HTTP client we can use (Http.CreateConnection only issues a GET and returns
 -- nothing), so this plugin calls curl. curl must be installed and on the PATH (or set curlPath).
@@ -27,8 +28,11 @@ local DEFAULT_DIR = "Resources/Server/ServerGuardian"
 local guard = nil -- the ServerGuardianCore instance, created in onInit
 local settings = nil
 local joins = {} -- playerID -> eventId of the join we checked
-local vehicles = {} -- playerID -> { [vehicleID] = true }, for the movement checks (memory only)
+-- playerID -> { [vehicleID] = model name }, for the movement checks and so a delete (which carries no
+-- data) can say what was deleted. Memory only, and forgotten when the player leaves.
+local vehicles = {}
 local SAMPLE_EVENT = "sgGameSample"
+local FLUSH_EVENT = "sgGameFlush" -- about once a second: sends the waiting game events, collects answers
 local REFRESH_EVENT = "sgConfigRefresh"
 local HEARTBEAT_EVENT = "sgHeartbeat"
 local REFRESH_MS = 10 * 60 * 1000 -- how often the settings are asked for again, so a server nobody joins still hears
@@ -110,15 +114,20 @@ end
 
 local isWindows = package.config:sub(1, 1) == "\\"
 
--- Runs curl and returns the HTTP status and body, or nil on any failure. Everything placed in the
--- command line is either fixed or generated here: the request body goes through a file so nothing a
--- player controls (such as a name) is ever part of a shell command, and the key goes through a curl
--- config file so it does not show up in the process list.
-local function curlRequest(method, path, body, wait)
+-- Builds the curl command line for one request. Everything placed in it is either fixed or generated
+-- here: the request body goes through a file so nothing a player controls (such as a name) is ever
+-- part of a shell command, and the key goes through a curl config file so it does not show up in the
+-- process list. Returns the line and the names of the files it uses, or nil if the body cannot be
+-- written. `headers` makes curl keep the answer's headers in a file too.
+local function curlCommand(method, path, body, headers)
   local id = string.format("%x%x", os.time(), math.random(0, 0xfffff))
   local work = settings.dir .. "/work"
-  local bodyFile = work .. "/req-" .. id .. ".json"
-  local outFile = work .. "/res-" .. id .. ".txt"
+  local files = {
+    body = work .. "/req-" .. id .. ".json",
+    out = work .. "/res-" .. id .. ".txt",
+    headers = work .. "/hdr-" .. id .. ".txt",
+    status = work .. "/sta-" .. id .. ".txt",
+  }
   local configFile = work .. "/curl.conf"
 
   local command = {
@@ -129,14 +138,18 @@ local function curlRequest(method, path, body, wait)
     "-K",
     '"' .. configFile .. '"',
     "-o",
-    '"' .. outFile .. '"',
+    '"' .. files.out .. '"',
     "-w",
     '"%{http_code}"',
     "-X",
     method,
   }
+  if headers then
+    command[#command + 1] = "-D"
+    command[#command + 1] = '"' .. files.headers .. '"'
+  end
   if body then
-    local file = io.open(bodyFile, "wb")
+    local file = io.open(files.body, "wb")
     if not file then
       return nil
     end
@@ -145,10 +158,19 @@ local function curlRequest(method, path, body, wait)
     command[#command + 1] = "-H"
     command[#command + 1] = '"content-type: application/json"'
     command[#command + 1] = "--data-binary"
-    command[#command + 1] = '"@' .. bodyFile .. '"'
+    command[#command + 1] = '"@' .. files.body .. '"'
   end
   command[#command + 1] = '"' .. settings.base .. path .. '"'
-  local line = table.concat(command, " ")
+  return table.concat(command, " "), files
+end
+
+-- Runs curl and returns the HTTP status and body, or nil on any failure.
+local function curlRequest(method, path, body, wait)
+  local line, files = curlCommand(method, path, body, false)
+  if not line then
+    return nil
+  end
+  local bodyFile, outFile = files.body, files.out
 
   if not wait then
     -- Do not hold up the server: start it in the background, and have it tidy up its own files.
@@ -175,6 +197,75 @@ local function curlRequest(method, path, body, wait)
   return status, response or ""
 end
 
+-- Requests started in the background whose answer has not been collected yet (see curlStart).
+local pendingAnswers = {}
+
+-- Starts a request in the background and, when its answer is in, calls callback(status, body, headers)
+-- from pollAnswers (the plugin's one-second timer), never from here. The server is not held up: this is
+-- how a batch of game events is sent, and its answer is still seen, so a 429, a refusal or a failure
+-- can be acted on. The background shell leaves the status last (written to a temporary name and then
+-- renamed, so it appears whole), and the files are tidied up when the answer is collected.
+local function curlStart(method, path, body, callback)
+  local line, files = curlCommand(method, path, body, true)
+  if not line then
+    callback(nil)
+    return
+  end
+  local status = files.status
+  if isWindows then
+    os.execute(
+      'start "" /b cmd /c "' .. line:gsub('"', '""') .. ' > ""' .. status .. '.tmp"" 2>NUL & move /y ""' .. status
+        .. '.tmp"" ""' .. status .. '"" >NUL & del /q ""' .. files.body .. '"" >NUL" >NUL 2>&1'
+    )
+  else
+    os.execute(
+      "( " .. line .. ' > "' .. status .. '.tmp" 2>/dev/null ; mv -f "' .. status .. '.tmp" "' .. status .. '" ; rm -f "'
+        .. files.body .. '" ) >/dev/null 2>&1 &'
+    )
+  end
+  -- The request gives up by itself after settings.timeout; this waits a little longer than that.
+  pendingAnswers[#pendingAnswers + 1] = { files = files, callback = callback, giveUpAt = os.time() + settings.timeout + 10 }
+end
+
+-- The headers curl kept, as a table of lowercase names (only the last answer's, if there were several).
+local function readHeaders(path)
+  local headers = {}
+  for line in (readFile(path) or ""):gmatch("[^\r\n]+") do
+    local name, value = line:match("^([%w%-]+):%s*(.-)%s*$")
+    if name then
+      headers[name:lower()] = value
+    end
+  end
+  return headers
+end
+
+-- Collects the answers that have arrived, and gives up on those that never will (the callback then gets
+-- nil, as for any failure). Called every second by the flush timer, so an answer is seen within a second.
+local function pollAnswers()
+  local index = 1
+  while index <= #pendingAnswers do
+    local pending = pendingAnswers[index]
+    local text = readFile(pending.files.status)
+    if text or os.time() >= pending.giveUpAt then
+      table.remove(pendingAnswers, index)
+      local status = tonumber((text or ""):match("%d+"))
+      local response = readFile(pending.files.out)
+      local headers = readHeaders(pending.files.headers)
+      for _, file in pairs(pending.files) do
+        os.remove(file)
+      end
+      os.remove(pending.files.status .. ".tmp")
+      if not status or status == 0 then
+        pending.callback(nil)
+      else
+        pending.callback(status, response or "", headers)
+      end
+    else
+      index = index + 1
+    end
+  end
+end
+
 local function writeCurlConfig()
   FS.CreateDirectory(settings.dir .. "/work")
   local file = io.open(settings.dir .. "/work/curl.conf", "wb")
@@ -186,13 +277,22 @@ local function writeCurlConfig()
   return true
 end
 
+local shuttingDown = false
+
 local function httpForCore(method, path, body, callback)
-  -- Leave events and game events are fire-and-forget; everything else waits for the answer (with a
-  -- time limit). A game event can come every second for every player, and waiting for each one would
-  -- hold up the whole server, so it is started in the background and counted as sent: the plugin
-  -- cannot see the answer, and relies on its own limits and the settings refresh every ten minutes
-  -- (which says if the operator has switched game events off, or the key no longer works).
-  if path == "/v1/events/game" then
+  -- Leave events and single game events are fire-and-forget; a batch of game events is run in the
+  -- background and its answer collected a moment later (see curlStart); everything else waits for the
+  -- answer (with a time limit). A game event can come every second for every player, and waiting for
+  -- each one would hold up the whole server. A single event (a server that does not batch) is counted
+  -- as sent: the plugin cannot see the answer, and relies on its own limits and the settings refresh
+  -- every ten minutes (which says if the operator has switched game events off, or the key no longer
+  -- works). A batch is seen: a 429, a refusal or a failure is acted on, by the core.
+  if path == "/v1/events/batch" and not shuttingDown then
+    curlStart(method, path, body, callback)
+    return
+  end
+  if path == "/v1/events/game" or path == "/v1/events/batch" then
+    -- (A batch sent as the server stops is not waited for: nothing is left to see the answer.)
     curlRequest(method, path, body, false)
     callback(202, "")
     return
@@ -255,6 +355,10 @@ function onInit()
   -- The settings are asked for again every ten minutes whether or not anyone joins, so a server
   -- with nobody on it still learns that game events were switched off (or on).
   MP.CreateEventTimer(REFRESH_EVENT, REFRESH_MS)
+  -- Once a second the waiting game events are sent if they have waited long enough (the core decides),
+  -- and the answers to the batches already sent are collected. Nothing happens while game events are
+  -- off or nothing is waiting.
+  MP.CreateEventTimer(FLUSH_EVENT, ServerGuardianCore.GAME_TICK_SECONDS * 1000)
   -- About once a minute the plugin says it is there, with how many players are on, so the portal can
   -- show the server online or offline. It runs whether or not game events or reports are on.
   MP.CreateEventTimer(HEARTBEAT_EVENT, ServerGuardianCore.HEARTBEAT_SECONDS * 1000)
@@ -280,6 +384,22 @@ end
 function sgHeartbeat()
   if guard then
     guard:heartbeat(playerCount())
+  end
+end
+
+function sgGameFlush()
+  if guard then
+    pollAnswers()
+    guard:tick()
+  end
+end
+
+-- BeamMP-Server tells plugins when it is stopping: send what is waiting, once, without waiting for the
+-- answer. (A server version that does not send it just never calls this.)
+function onShutdown()
+  if guard then
+    shuttingDown = true
+    guard:flushGameEvents()
   end
 end
 
@@ -640,13 +760,17 @@ end
 -- and the JSON has the model under "jbm" (the server itself looks for "jbm" to find the unicycle). If it
 -- cannot be read, the item is just "vehicle". Only the part after the first "{" is searched, so a
 -- player's name cannot be mistaken for it.
-local function vehicleModel(data)
+local function parsedModel(data)
   if type(data) ~= "string" then
-    return "vehicle"
+    return nil
   end
   local json = data:match("({.*)")
   local model = json and json:match('"jbm"%s*:%s*"([^"]*)"')
-  return model or "vehicle"
+  return model ~= "" and model or nil
+end
+
+local function vehicleModel(data)
+  return parsedModel(data) or "vehicle"
 end
 
 local function playerName(playerID)
@@ -658,7 +782,7 @@ end
 -- plugin cannot tell, so a cancelled spawn is still reported (and tracked until the vehicle is deleted).
 function onVehicleSpawn(playerID, vehicleID, data)
   vehicles[playerID] = vehicles[playerID] or {}
-  vehicles[playerID][vehicleID] = true
+  vehicles[playerID][vehicleID] = vehicleModel(data)
   if guard then
     guard.tracker:start(playerID .. ":" .. vehicleID, SKIP_AFTER_SPAWN)
   end
@@ -675,12 +799,31 @@ function onVehicleReset(playerID, vehicleID)
   end
 end
 
+-- A player changed a vehicle (parts, paint). BeamMP gives onVehicleEdited the same kind of data string as
+-- a spawn, so the model comes from the same parser; if it cannot be read, the model remembered from the
+-- spawn is used. An edit of a vehicle we never saw spawn (the plugin started after it) is remembered too.
+-- Returning nothing leaves the edit to go ahead: returning 1 would cancel it.
+function onVehicleEdited(playerID, vehicleID, data)
+  vehicles[playerID] = vehicles[playerID] or {}
+  local model = parsedModel(data) or vehicles[playerID][vehicleID] or "vehicle"
+  vehicles[playerID][vehicleID] = model
+  if guard and guard.gameEnabled and joins[playerID] then
+    guard:edit(tostring(playerID), joins[playerID], playerName(playerID), model)
+  end
+end
+
+-- A vehicle was deleted. The handler is given no data, so what it was comes from what was remembered
+-- when it was spawned or edited ("unknown" if the plugin never saw either).
 function onVehicleDeleted(playerID, vehicleID)
+  local model = vehicles[playerID] and vehicles[playerID][vehicleID]
   if vehicles[playerID] then
     vehicles[playerID][vehicleID] = nil
   end
   if guard then
     guard.tracker:forget(playerID .. ":" .. vehicleID)
+  end
+  if guard and guard.gameEnabled and joins[playerID] then
+    guard:remove(tostring(playerID), joins[playerID], playerName(playerID), type(model) == "string" and model or "unknown")
   end
 end
 
@@ -720,7 +863,10 @@ end
 MP.RegisterEvent("onChatMessage", "onChatMessage")
 MP.RegisterEvent("onVehicleSpawn", "onVehicleSpawn")
 MP.RegisterEvent("onVehicleReset", "onVehicleReset")
+MP.RegisterEvent("onVehicleEdited", "onVehicleEdited")
 MP.RegisterEvent("onVehicleDeleted", "onVehicleDeleted")
+MP.RegisterEvent("onShutdown", "onShutdown")
+MP.RegisterEvent(FLUSH_EVENT, "sgGameFlush")
 MP.RegisterEvent(SAMPLE_EVENT, "sgGameSample")
 MP.RegisterEvent(REFRESH_EVENT, "sgConfigRefresh")
 MP.RegisterEvent(HEARTBEAT_EVENT, "sgHeartbeat")
