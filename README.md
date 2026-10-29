@@ -45,10 +45,22 @@ When the server owner turns **player reports** on for the server in the ServerGu
 - **What is sent:** the category, the optional note the player typed (cut to 200 characters), the account ids of the reporter and of the reported player, and a reference built from the reported player's name (letters and digits only) so staff can recognise it. **What is not sent:** chat, IP addresses, or anything else about either player. Nothing about a report (note, names, ids) is ever logged.
 - If ServerGuardian cannot be reached the player is told the report could not be sent. Reports need the key's ingest scope, which every normal key has.
 
+## Game events
+
+When the server owner turns **game events** on for the server in the ServerGuardian portal (off by default: "Let the plugin send game events"), the plugin tells ServerGuardian when a player **spawns a vehicle** and runs two **movement checks** on the server: a speed or a jump the game could not produce, and a change of speed that is not believable. The operator sees them in the portal (on plans that keep history) and can have them sent to a webhook.
+
+- **What is sent:** for a spawn, the short name of what was spawned (the `jbm` model name in the spawn data, or just `vehicle` if it cannot be read); for a flag, which check failed (`impossible_move` or `acceleration`) and whether it was `low` or `high`. Both carry the id of the player's join (the reference ServerGuardian already has for them) and a short label, the player's in-game name with only letters, digits, spaces and `_ . : / -` kept. **What is never sent:** a position or any coordinate, chat, an IP address, a platform id, or a hardware id. Nothing about an event (label, item, ids) is ever logged.
+- **The numbers come from ServerGuardian.** The speed, jump and acceleration limits, and how often to look, are in the settings the plugin already fetches, so they can be tuned without a new release. They are placeholders until they have been tried on real servers.
+- **A flag is a prompt for a person to look.** Nothing is ever kicked, banned or messaged because of one. A given check flags a given player at most once a minute, and a player is held to 20 events a minute (400 for the server).
+- While game events are off (the default) the plugin does not sample or send anything at all.
+- Checks use `MP.GetPositionRaw` (a table with `pos = {x, y, z}`) once a second for each of a player's vehicles, driven by `MP.CreateEventTimer`; a vehicle reset (`onVehicleReset`) starts that vehicle's track again, so a reset is not a jump. The handlers return nothing, so a spawn is never cancelled. Vehicles spawned before the plugin started are not checked until they are respawned.
+- Game events are sent in the background (like leave events), so a slow or unreachable ServerGuardian never holds up the server. The plugin therefore cannot see the answer: it relies on its own limits and on the hourly settings refresh, which says if the operator has switched game events off.
+- **Verified against** the BeamMP-Server source and docs (`onVehicleSpawn`, `onVehicleReset`, `onVehicleDeleted`, `MP.GetPositionRaw`, `MP.GetPlayerVehicles`, `MP.CreateEventTimer`); **not run on a real BeamMP server.** The table keys of `MP.GetPositionRaw` (`pos`, `vel`, ...) come from the official docs, not from running it.
+
 ## Shared core and tests
 
 `sg_core.lua` is shared with the [FiveM resource](https://github.com/ServerGuardian/FiveM_Plugin). **This repository is where it is edited.** After a change, run `./sync-core.sh` (it copies to `../FiveM_Plugin`) and commit there too.
 
-The end-to-end tests run this plugin against the real API, so they live in [Backend](https://github.com/ServerGuardian/Backend) (`tests/mods.beammp.e2e.test.ts`), with the fake BeamMP and FiveM environments. Check this repository out next to Backend as `../BeamMP_Plugin` and run `pnpm test` there. Needs `lua` and `curl`.
+The end-to-end tests run this plugin against the real API, so they live in [Backend](https://github.com/ServerGuardian/Backend) (`tests/mods.beammp.e2e.test.ts`), with the fake BeamMP and FiveM environments. Check this repository out next to Backend as `../BeamMP_Plugin` and run `pnpm test` there. Needs `lua` and `curl`. The game-event checks in the core also have their own tests with made-up positions (`tests/mods.game-core.test.ts`).
 
 The earlier 2025 BeamMP resource is kept on the `legacy-2025` branch.

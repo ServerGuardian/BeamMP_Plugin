@@ -10,12 +10,15 @@
 --     hardware id unless the player explicitly said yes;
 --   * a player report carries a category, an optional short note the player typed, and the platform ids
 --     of the two players: never chat, a name (beyond the operator's own reference), or an address;
+--   * a game event (a spawn, or a movement flag) carries the id of the player's join, a short label,
+--     and either an item name or the kind of check: never a position, a coordinate, chat, an address
+--     or a platform id. The movement checks run here, on the game server, and send only a flag;
 --   * a blocked player is told only the fixed wording from the API, never why.
 
 ServerGuardianCore = ServerGuardianCore or {}
 local M = ServerGuardianCore
 
-M.VERSION = "0.3.0"
+M.VERSION = "0.4.0"
 
 -- Used until the API has been reached once, and whenever it cannot be. Kept short on purpose: the
 -- authoritative wording comes from GET /v1/mod/config so operators cannot change it.
@@ -71,8 +74,135 @@ local REPORT_CONFIRM_SECONDS = 120
 local REPORTS_PER_WINDOW = 3 -- a player's own limit, so they are not told "too many" by the API
 local REPORT_WINDOW_SECONDS = 600
 
+-- Game events (decision D41, group 2). The API's own limit is 600 events a minute per key, so a
+-- player is held to far less, and the whole server to a little under that.
+local GAME_EVENTS_PER_PLAYER_WINDOW = 20
+local GAME_EVENT_WINDOW_SECONDS = 60
+local GAME_EVENTS_PER_SERVER_WINDOW = 400
+local GAME_BACKOFF_SECONDS = 60
+local MAX_LABEL = 32
+local MAX_ITEM = 40
+local GAP_FACTOR = 3 -- a gap longer than this many sample periods starts the track again
+local HIGH_RATIO = 1.5 -- a value this many times over its threshold is "high", not "low"
+
 local Guard = {}
 Guard.__index = Guard
+
+-- Text for a game event: the schema allows letters, digits, space and _ . : / - only, and refuses
+-- anything that looks like an address or a long hexadecimal code. Only ASCII letters and digits are
+-- kept, so a name with other characters loses them rather than being refused. Returns nil if nothing
+-- usable is left.
+local function looksLikeIdentifier(text)
+  if text:find(string.rep("%x", 32)) then
+    return true
+  end
+  if text:match("^%d+%.%d+%.%d+%.%d+$") then
+    return true
+  end
+  if text:find(":", 1, true) and text:match("^[%x:%.]+$") then
+    return true -- an IPv6 address
+  end
+  return false
+end
+
+local function gameText(text, maxBytes)
+  if type(text) ~= "string" then
+    return nil
+  end
+  text = text:gsub("[^%w _%.:/%-]", ""):gsub("%s+", " "):match("^%s*(.-)%s*$")
+  if text == "" or looksLikeIdentifier(text) then
+    return nil
+  end
+  return text:sub(1, maxBytes):match("^(.-)%s*$")
+end
+M.gameText = gameText
+
+--- Position tracking for the movement checks. Pure: it is given times and positions and answers with
+-- flags, so it is the same on every platform and can be tested with made-up numbers. It never keeps
+-- more than the last position, the last speed and when each check last flagged, for each key.
+local Tracker = {}
+Tracker.__index = Tracker
+
+function M.newTracker()
+  return setmetatable({ tracks = {} }, Tracker)
+end
+
+--- Forget what is known about this key, so the next sample is a fresh start (a respawn, a teleport
+-- command, a change of world, a vehicle reset).
+function Tracker:reset(key)
+  local track = self.tracks[key]
+  if track then
+    track.last = nil
+    track.speed = nil
+  end
+end
+
+--- Forget the key altogether (the player or vehicle has gone).
+function Tracker:forget(key)
+  self.tracks[key] = nil
+end
+
+--- Takes one sample. `checks` is what the API serves (sampleSeconds, impossibleMove.maxSpeed and
+-- .teleportDistance, acceleration.maxAcceleration, flagCooldownSeconds). Returns a list of flags,
+-- each { check = "impossible_move" | "acceleration", severity = "low" | "high" }, usually empty.
+-- The first sample, a gap longer than three sample periods, and the sample after a reset only set
+-- the starting point.
+function Tracker:sample(key, t, x, y, z, checks)
+  local track = self.tracks[key]
+  if not track then
+    track = { flagged = {} }
+    self.tracks[key] = track
+  end
+  local last = track.last
+  track.last = { t = t, x = x, y = y, z = z }
+  if not last then
+    track.speed = nil
+    return {}
+  end
+  local dt = t - last.t
+  if dt <= 0 then
+    track.last = last -- a sample out of order: keep the earlier one
+    return {}
+  end
+  if dt > GAP_FACTOR * checks.sampleSeconds then
+    track.speed = nil
+    return {}
+  end
+  local dx, dy, dz = x - last.x, y - last.y, z - last.z
+  local distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+  local speed = distance / dt
+  local previousSpeed = track.speed
+  track.speed = speed
+
+  local flags = {}
+  local function consider(check, ratio)
+    if ratio <= 1 then
+      return false
+    end
+    local lastFlag = track.flagged[check]
+    if lastFlag and t - lastFlag < checks.flagCooldownSeconds then
+      return true -- over the line, but flagged a moment ago
+    end
+    track.flagged[check] = t
+    flags[#flags + 1] = { check = check, severity = ratio > HIGH_RATIO and "high" or "low" }
+    return true
+  end
+
+  local moveRatio = math.max(
+    speed / checks.impossibleMove.maxSpeed,
+    distance / checks.impossibleMove.teleportDistance
+  )
+  if consider("impossible_move", moveRatio) then
+    -- A jump is not a change of speed: do not also flag it, or the sample after it.
+    track.speed = nil
+    return flags
+  end
+  if previousSpeed then
+    consider("acceleration", math.abs(speed - previousSpeed) / dt / checks.acceleration.maxAcceleration)
+  end
+  return flags
+end
+
 
 --- Creates a guard.
 -- opts.apiBase       API address without a trailing slash
@@ -104,6 +234,14 @@ function M.new(opts)
   self.reportPending = {} -- player key -> { fingerprint, at }: a report waiting for its confirmation
   self.reportConfirmed = {} -- player key -> true once they have seen the notice and confirmed
   self.reportSent = {} -- player key -> list of times a report was sent, for the player's own limit
+  self.clock = opts.clock or self.now -- seconds, and finer than a second where the platform allows
+  self.gameEnabled = false -- the operator turns game events on in the portal; absent means off
+  self.gameChecks = nil
+  self.gameBackoffUntil = 0
+  self.gamePlayerSent = {} -- player key -> list of times a game event was sent
+  self.gameServerSent = {} -- times of every game event sent, for the whole server
+  self.tracker = M.newTracker()
+  self.onGameConfig = nil -- set by the platform: called when game events are switched on or off
   self.configFetchedAt = nil
   self.counter = 0
   self.stats = { checks = 0, passes = 0, blocks = 0, errors = 0, skipped = 0 }
@@ -161,6 +299,7 @@ function Guard:refreshConfig(callback, force)
           tooMany = type(en.reportTooMany) == "string" and en.reportTooMany or defaults.tooMany,
           categories = categories or defaults.categories,
         }
+        self:_setGameConfig(decoded.gameEvents)
         self.configFetchedAt = now
         ok = true
       end
@@ -172,6 +311,47 @@ function Guard:refreshConfig(callback, force)
       callback(ok)
     end
   end)
+end
+
+--- Reads the `gameEvents` part of the settings: off unless it says `enabled: true` with the numbers the
+-- checks need. Anything missing or odd means off. Tells the platform when it changes.
+function Guard:_setGameConfig(settings)
+  local enabled, checks = false, nil
+  if type(settings) == "table" and settings.enabled == true and type(settings.checks) == "table" then
+    local c = settings.checks
+    local move, accel = c.impossibleMove, c.acceleration
+    if
+      type(c.sampleSeconds) == "number" and c.sampleSeconds > 0
+      and type(c.flagCooldownSeconds) == "number"
+      and type(move) == "table" and type(move.maxSpeed) == "number" and move.maxSpeed > 0
+      and type(move.teleportDistance) == "number" and move.teleportDistance > 0
+      and type(accel) == "table" and type(accel.maxAcceleration) == "number" and accel.maxAcceleration > 0
+    then
+      enabled = true
+      checks = {
+        sampleSeconds = c.sampleSeconds,
+        flagCooldownSeconds = c.flagCooldownSeconds,
+        impossibleMove = { maxSpeed = move.maxSpeed, teleportDistance = move.teleportDistance },
+        acceleration = { maxAcceleration = accel.maxAcceleration },
+      }
+    end
+  end
+  self:_applyGameConfig(enabled, checks)
+end
+
+function Guard:_applyGameConfig(enabled, checks)
+  local changed = enabled ~= self.gameEnabled
+    or (enabled and self.gameChecks and self.gameChecks.sampleSeconds ~= checks.sampleSeconds)
+  self.gameEnabled = enabled
+  self.gameChecks = checks
+  if not enabled then
+    self.tracker = M.newTracker() -- nothing is kept while it is off
+    self.gamePlayerSent = {}
+    self.gameServerSent = {}
+  end
+  if changed and self.onGameConfig then
+    self.onGameConfig(enabled, checks)
+  end
 end
 
 function Guard:_decode(body)
@@ -578,6 +758,126 @@ function Guard:_categoryList()
     parts[#parts + 1] = id .. " (" .. tostring(self.reportWording.categories[id]) .. ")"
   end
   return table.concat(parts, ", ")
+end
+
+-- ---------------------------------------------------------------------------------------------------
+-- Game events (decision D41, group 2): spawns, and flags from the movement checks.
+-- ---------------------------------------------------------------------------------------------------
+
+--- The id of a game event. Opaque, and unique for this server.
+function Guard:_gameEventId()
+  self.counter = self.counter + 1
+  return string.format("ev-%s-%x-%x", self.prefix, self.now(), self.counter)
+end
+
+--- True when this player may have another event sent now, counting it if so. Keeps the server well
+-- inside the API's own limit, and one busy player from using it all.
+function Guard:_gameAllowance(playerKey)
+  local now = self.now()
+  local function recent(list)
+    local kept = {}
+    for _, at in ipairs(list) do
+      if now - at < GAME_EVENT_WINDOW_SECONDS then
+        kept[#kept + 1] = at
+      end
+    end
+    return kept
+  end
+  local mine = recent(self.gamePlayerSent[playerKey] or {})
+  local all = recent(self.gameServerSent)
+  self.gamePlayerSent[playerKey] = mine
+  self.gameServerSent = all
+  if #mine >= GAME_EVENTS_PER_PLAYER_WINDOW or #all >= GAME_EVENTS_PER_SERVER_WINDOW then
+    return false
+  end
+  mine[#mine + 1] = now
+  all[#all + 1] = now
+  return true
+end
+
+--- Sends one game event. `body` has the type's own fields; the id, the join reference and the label
+-- are added here. Nothing is sent while game events are off or backed off, for a player with no join
+-- reference, or past the limits. Quiet on every failure: nothing depends on it.
+-- input: { playerKey, joinEventId, label (optional), type = "spawn" | "flag", item | check + severity }
+-- callback (optional) receives true when the API accepted it.
+function Guard:gameEvent(input, callback)
+  local function done(ok)
+    if callback then
+      callback(ok)
+    end
+  end
+  if not self.gameEnabled or self.now() < self.gameBackoffUntil then
+    return done(false)
+  end
+  if type(input) ~= "table" or type(input.joinEventId) ~= "string" or input.joinEventId == "" then
+    return done(false)
+  end
+  local body = {
+    eventId = self:_gameEventId(),
+    joinEventId = input.joinEventId,
+    type = input.type,
+    label = gameText(input.label, MAX_LABEL),
+  }
+  if input.type == "spawn" then
+    body.item = gameText(input.item, MAX_ITEM) or "vehicle"
+  elseif input.type == "flag" then
+    body.check = input.check
+    body.severity = input.severity
+  else
+    return done(false)
+  end
+  if not self:_gameAllowance(tostring(input.playerKey)) then
+    return done(false)
+  end
+  self.http("POST", "/v1/events/game", body, function(status, responseBody)
+    if status == 202 then
+      return done(true)
+    end
+    -- Only the status is logged: never an item, a label or an id.
+    self.log("debug", "could not send a game event (status " .. tostring(status) .. ")")
+    if status == 429 then
+      self.gameBackoffUntil = self.now() + GAME_BACKOFF_SECONDS
+    elseif status == 403 then
+      local decoded = type(responseBody) == "string" and self:_decode(responseBody) or nil
+      if decoded and decoded.error == "game_events_disabled" then
+        -- Off until the next settings refresh says otherwise.
+        self:_applyGameConfig(false, nil)
+      end
+    end
+    done(false)
+  end)
+end
+
+--- A player spawned something (`item` is its short name). Sent only if game events are on.
+function Guard:spawn(playerKey, joinEventId, label, item)
+  self:gameEvent({
+    playerKey = playerKey,
+    joinEventId = joinEventId,
+    label = label,
+    type = "spawn",
+    item = item,
+  })
+end
+
+--- Takes a position sample for a player or a vehicle and sends a flag for anything the checks do not
+-- believe. `key` tells one track from another. The position is used here and goes no further.
+function Guard:samplePosition(playerKey, key, joinEventId, label, x, y, z)
+  if not self.gameEnabled or not self.gameChecks then
+    return
+  end
+  if type(x) ~= "number" or type(y) ~= "number" or type(z) ~= "number" then
+    return
+  end
+  for _, flag in ipairs(self.tracker:sample(key, self.clock(), x, y, z, self.gameChecks)) do
+    self:gameEvent({
+      playerKey = playerKey,
+      joinEventId = joinEventId,
+      label = label,
+      type = "flag",
+      check = flag.check,
+      severity = flag.severity,
+    })
+  end
 end
 
 return M

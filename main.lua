@@ -12,6 +12,11 @@
 -- `/report <player> <category> [what happened]` in chat. It is sent to the server's staff through
 -- ServerGuardian and never shown to other players.
 --
+-- When the server owner turns game events on in the portal, the plugin also tells ServerGuardian when
+-- a player spawns a vehicle (its model name), and runs a few movement checks on the server (a speed
+-- or a jump the game could not produce) and sends only a flag when one fails. Positions never leave
+-- the server. A flag is a prompt for a person to look: nothing is ever kicked or banned because of it.
+--
 -- BeamMP's Lua has no HTTP client we can use (Http.CreateConnection only issues a GET and returns
 -- nothing), so this plugin calls curl. curl must be installed and on the PATH (or set curlPath).
 -- BeamMP exposes no hardware id, so this plugin never sends one.
@@ -22,6 +27,8 @@ local DEFAULT_DIR = "Resources/Server/ServerGuardian"
 local guard = nil -- the ServerGuardianCore instance, created in onInit
 local settings = nil
 local joins = {} -- playerID -> eventId of the join we checked
+local vehicles = {} -- playerID -> { [vehicleID] = true }, for the movement checks (memory only)
+local SAMPLE_EVENT = "sgGameSample"
 -- Only when recordKicks is on: who is here and who left in the last few seconds, so a console `kick`
 -- typed after the player is gone can still be matched. Names are held in memory only. They are never
 -- logged or sent anywhere.
@@ -171,7 +178,16 @@ local function writeCurlConfig()
 end
 
 local function httpForCore(method, path, body, callback)
-  -- Leave events are fire-and-forget; everything else waits for the answer (with a time limit).
+  -- Leave events and game events are fire-and-forget; everything else waits for the answer (with a
+  -- time limit). A game event can come every second for every player, and waiting for each one would
+  -- hold up the whole server, so it is started in the background and counted as sent: the plugin
+  -- cannot see the answer, and relies on its own limits and the hourly settings refresh (which says if
+  -- the operator has switched game events off).
+  if path == "/v1/events/game" then
+    curlRequest(method, path, body, false)
+    callback(202, "")
+    return
+  end
   local wait = path ~= "/v1/events/player-leave"
   local status, response = curlRequest(method, path, body, wait)
   callback(status, response)
@@ -206,6 +222,14 @@ function onInit()
     log = log,
     prefix = "bm",
   })
+  -- Game events are off until ServerGuardian says otherwise. The sampling timer exists only while
+  -- they are on, and is moved or removed whenever a settings refresh changes that.
+  guard.onGameConfig = function(enabled, checks)
+    MP.CancelEventTimer(SAMPLE_EVENT)
+    if enabled and checks then
+      MP.CreateEventTimer(SAMPLE_EVENT, math.max(250, math.floor(checks.sampleSeconds * 1000)))
+    end
+  end
   guard:refreshConfig(function(ok)
     log("info", ok and "started" or "started with the built-in wording (could not reach the API)")
   end, true)
@@ -290,12 +314,17 @@ function onPlayerDisconnect(playerID)
   local eventId = joins[playerID]
   joins[playerID] = nil
   if guard then
+    for vehicleID in pairs(vehicles[playerID] or {}) do
+      guard.tracker:forget(playerID .. ":" .. vehicleID)
+    end
+    guard.gamePlayerSent[tostring(playerID)] = nil
     -- Forgotten, so an id BeamMP gives to someone new starts with no history.
     local key = tostring(playerID)
     guard.reportPending[key] = nil
     guard.reportConfirmed[key] = nil
     guard.reportSent[key] = nil
   end
+  vehicles[playerID] = nil
   if present[playerID] then
     recent[#recent + 1] = { name = present[playerID].name, beammp = present[playerID].beammp, left = os.time() }
     present[playerID] = nil
@@ -547,7 +576,87 @@ function onChatMessage(playerID, _playerName, message)
   return 1
 end
 
+-- ---------------------------------------------------------------------------------------------------
+-- Game events. None of these handlers returns anything: returning 1 from onVehicleSpawn would cancel
+-- the spawn, and we never interfere with the game.
+-- ---------------------------------------------------------------------------------------------------
+
+-- The model of a spawned vehicle. BeamMP gives onVehicleSpawn a string "roles:name:PID-VID:{json}",
+-- and the JSON has the model under "jbm" (the server itself looks for "jbm" to find the unicycle). If it
+-- cannot be read, the item is just "vehicle". Only the part after the first "{" is searched, so a
+-- player's name cannot be mistaken for it.
+local function vehicleModel(data)
+  if type(data) ~= "string" then
+    return "vehicle"
+  end
+  local json = data:match("({.*)")
+  local model = json and json:match('"jbm"%s*:%s*"([^"]*)"')
+  return model or "vehicle"
+end
+
+local function playerName(playerID)
+  local names = MP.GetPlayers()
+  return type(names) == "table" and names[playerID] or nil
+end
+
+function onVehicleSpawn(playerID, vehicleID, data)
+  vehicles[playerID] = vehicles[playerID] or {}
+  vehicles[playerID][vehicleID] = true
+  if guard and guard.gameEnabled and joins[playerID] then
+    guard:spawn(tostring(playerID), joins[playerID], playerName(playerID), vehicleModel(data))
+  end
+end
+
+-- A reset moves the vehicle (that is what it is for), so the next position starts the track again.
+function onVehicleReset(playerID, vehicleID)
+  if guard then
+    guard.tracker:reset(playerID .. ":" .. vehicleID)
+  end
+end
+
+function onVehicleDeleted(playerID, vehicleID)
+  if vehicles[playerID] then
+    vehicles[playerID][vehicleID] = nil
+  end
+  if guard then
+    guard.tracker:forget(playerID .. ":" .. vehicleID)
+  end
+end
+
+-- Called by the timer while game events are on. MP.GetPositionRaw(pid, vid) returns a table with
+-- pos = {x, y, z} (and vel, rot, ...) and an error string, which is empty on success.
+function sgGameSample()
+  if not guard or not guard.gameEnabled then
+    return
+  end
+  local names = MP.GetPlayers()
+  for playerID, list in pairs(vehicles) do
+    local joinEventId = joins[playerID]
+    if joinEventId then
+      for vehicleID in pairs(list) do
+        local position, problem = MP.GetPositionRaw(playerID, vehicleID)
+        local at = type(position) == "table" and type(position.pos) == "table" and position.pos or nil
+        if at and (problem == nil or problem == "") then
+          guard:samplePosition(
+            tostring(playerID),
+            playerID .. ":" .. vehicleID,
+            joinEventId,
+            type(names) == "table" and names[playerID] or nil,
+            at[1],
+            at[2],
+            at[3]
+          )
+        end
+      end
+    end
+  end
+end
+
 MP.RegisterEvent("onChatMessage", "onChatMessage")
+MP.RegisterEvent("onVehicleSpawn", "onVehicleSpawn")
+MP.RegisterEvent("onVehicleReset", "onVehicleReset")
+MP.RegisterEvent("onVehicleDeleted", "onVehicleDeleted")
+MP.RegisterEvent(SAMPLE_EVENT, "sgGameSample")
 MP.RegisterEvent("onPlayerJoin", "onPlayerJoin")
 MP.RegisterEvent("onPlayerDisconnect", "onPlayerDisconnect")
 MP.RegisterEvent("onConsoleInput", "onConsoleInput")
