@@ -31,7 +31,7 @@
 ServerGuardianCore = ServerGuardianCore or {}
 local M = ServerGuardianCore
 
-M.VERSION = "0.9.0"
+M.VERSION = "0.9.1"
 
 -- Used until the API has been reached once, and whenever it cannot be. Kept short on purpose: the
 -- authoritative wording comes from GET /v1/mod/config so operators cannot change it.
@@ -428,9 +428,72 @@ function M.new(opts)
   self.chatDropped = 0 -- lines dropped since the last debug line about it (a count: never any text)
   self.chatNoticeWarned = false
   self.configFetchedAt = nil
+  -- What the last answers from the API say about the connection: "unknown" until one arrives, then
+  -- "connected", "refused" (the key, plan or agreement), "unreachable" (no answer) or "error" (a status we
+  -- did not expect). `connectionDetail` is a fixed sentence for the operator: never a player, never a key.
+  self.connection = "unknown"
+  self.connectionDetail = nil
   self.counter = 0
   self.stats = { checks = 0, passes = 0, blocks = 0, errors = 0, skipped = 0 }
   return self
+end
+
+-- Error codes the API gives with a 402 or 403 that are worth telling the operator about, as fixed sentences.
+local REFUSAL_SENTENCES = {
+  dpa_required = "the Data Processing Agreement has not been accepted (portal: Agreement)",
+  plan_limit = "the plan does not allow this server (portal: Plan and billing)",
+  suspended = "this server's key is suspended",
+  revoked = "this API key has been revoked",
+  expired = "this API key has expired",
+}
+
+--- Remembers what an answer from the API says about the connection, and logs a fixed line when it changes.
+-- 429 says nothing about it and is ignored. Only the status and, for a refusal, a code from the list above
+-- are ever used.
+function Guard:_noteConnection(status, body)
+  local state, detail
+  if status == 200 or status == 204 then
+    state, detail = "connected", "connected, API key accepted"
+  elseif status == nil then
+    state, detail = "unreachable", "no answer from the API: check apiBase, that curl is installed, and the network"
+  elseif status == 429 then
+    return
+  elseif status == 401 then
+    state, detail = "refused", "the API key was refused: check apiKey in config.json (revoked, or for another server?)"
+  elseif status == 402 or status == 403 then
+    local code = nil
+    if type(body) == "string" then
+      local decoded = self:_decode(body)
+      if type(decoded) == "table" and type(decoded.error) == "string" then
+        code = decoded.error
+      end
+    end
+    state = "refused"
+    detail = (code and REFUSAL_SENTENCES[code]) or ("the API refused this server (status " .. tostring(status) .. ")")
+  else
+    state, detail = "error", "the API gave an unexpected answer (status " .. tostring(status) .. ")"
+  end
+  local previous = self.connection
+  self.connection, self.connectionDetail = state, detail
+  if previous ~= state and previous ~= "unknown" then
+    self.log(state == "connected" and "info" or "warn", "connection changed: " .. detail)
+  end
+end
+
+--- The connection as last seen: "unknown", "connected", "refused", "unreachable" or "error", and a sentence.
+function Guard:connectionStatus()
+  return self.connection, self.connectionDetail
+end
+
+--- What this server is set to right now, for the start-up banner: plain values, nothing secret.
+function Guard:summary()
+  return {
+    failMode = self.failMode,
+    gameEvents = self.gameEnabled == true,
+    reports = self.reportsEnabled == true,
+    chatModeration = self.chatEnabled == true,
+    shareBans = self.localSettings.shareBans,
+  }
 end
 
 --- Tells the API the server is there, with how many players are on (a whole number, or nothing).
@@ -463,8 +526,9 @@ function Guard:heartbeat(players, callback)
   end
   self.heartbeatInFlight = true
   self.heartbeatLastAt = now
-  self.http("POST", "/v1/mod/heartbeat", body, function(status)
+  self.http("POST", "/v1/mod/heartbeat", body, function(status, response)
     self.heartbeatInFlight = false
+    self:_noteConnection(status, response)
     if status == 204 then
       return done(true)
     end
@@ -522,8 +586,9 @@ function Guard:_sendSettings(done)
     return done()
   end
   self.settingsSending = true
-  self.http("PUT", "/v1/mod/settings", body, function(status)
+  self.http("PUT", "/v1/mod/settings", body, function(status, response)
     self.settingsSending = false
+    self:_noteConnection(status, response)
     if status ~= 200 then
       if status == 429 then
         self.log("warn", "ServerGuardian refused the settings (too many changes in an hour), using the config file")
@@ -537,6 +602,7 @@ end
 
 function Guard:_fetchConfig(now, callback)
   self.http("GET", "/v1/mod/config", nil, function(status, body)
+    self:_noteConnection(status, body)
     local ok = false
     if status == 200 and type(body) == "string" then
       local decoded = self:_decode(body)

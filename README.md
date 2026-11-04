@@ -12,6 +12,27 @@ A BeamMP server plugin that asks ServerGuardian whether a joining player is link
 
 Players with a BeamMP guest session have no account id, so they cannot be checked or banned; they are let in and nothing is sent. That makes guests a way around any ban. To refuse them, set `AllowGuests = false` under `[General]` in BeamMP's `ServerConfig.toml` (or `BEAMMP_ALLOW_GUESTS=false`): it is BeamMP's own setting, and your choice.
 
+## What you see when it starts
+
+The plugin prints a shield, its version and the API address to the server console as soon as it loads, then a line saying whether it reached ServerGuardian a moment later:
+
+```
+  ___________       ServerGuardian for BeamMP
+ /     _     \      Version 0.9.1
+|     / \     |     API: https://test.example.com
+|    / _ \    |     Connecting in the background...
+ \  /_/ \_\  /
+  \_________/
+
+[ServerGuardian] info: started
+[ServerGuardian] info: CONNECTED: connected, API key accepted
+[ServerGuardian] info: fail mode open | game events off | reports off | chat checking off
+```
+
+If it cannot connect you get `NOT CONNECTED:` and the reason: **the API key was refused** (check `apiKey` in `config.json`: it may be revoked or belong to another server), **the Data Processing Agreement has not been accepted** or **the plan does not allow this server** (both fixed in the portal), or **no answer from the API** (check `apiBase`, that `curl` is installed and the network), together with what happens to players meanwhile (let in unchecked, or kept out, depending on `failMode`). It keeps trying, and writes one line if the connection is lost or comes back later. A key still set to the example from `config.example.json` stops the plugin from starting, with a line that says so.
+
+**Start-up never holds the server up.** BeamMP waits for a plugin's `onInit` and gives up on one that takes too long (`'onInit' ... failed to execute in time`), so the first requests to ServerGuardian (the settings, the wording and the first heartbeat) run in the background and their answers are collected by the plugin's one-second timer. Only a join check, which must have an answer before the player is let in, is waited for.
+
 ## Settings
 
 This server's behaviour is set in **`config.json`, in the `settings` object**, next to the API key. The ServerGuardian portal only **shows** what each server is set to (read-only, with when the plugin last reported it); it cannot change them.
@@ -36,7 +57,7 @@ This server's behaviour is set in **`config.json`, in the `settings` object**, n
 On join the plugin shows the ServerGuardian notice, sends the player's BeamMP account id and IP address (and, if they agree to the optional hardware check, a hardware token) and removes the player if the answer is "block". Nothing a player controls reaches a shell command, and the key is never logged. When a player leaves, the plugin says so.
 
 
-**Heartbeat.** About once a minute (and once at start-up) the plugin tells ServerGuardian it is there and how many players are on, so the portal can show the server as online or offline. The count is the only thing sent, it is never logged, and it runs whether or not game events or reports are on. BeamMP waits for the answer (with the usual time limit), at most one at a time. A refused key, plan or permission pauses it for ten minutes, too many requests for one.
+**Heartbeat.** About once a minute (and once at start-up) the plugin tells ServerGuardian it is there and how many players are on, so the portal can show the server as online or offline. The count is the only thing sent, it is never logged, and it runs whether or not game events or reports are on. It runs in the background (see "What you see when it starts" above): the server never waits for it, and only one is in flight at a time. A refused key, plan or permission pauses it for ten minutes, too many requests for one.
 
 ## Chat moderation
 

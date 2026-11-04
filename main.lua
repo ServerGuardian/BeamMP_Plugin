@@ -88,6 +88,9 @@ local function loadSettings()
   if type(key) ~= "string" or not key:match("^sg_[%w]+_[%w_%-]+$") then
     return nil, "apiKey is missing or not a ServerGuardian key"
   end
+  if key:find("paste-your-key-here", 1, true) then
+    return nil, "apiKey is still the example from config.example.json: paste the key made in the ServerGuardian portal"
+  end
   if type(base) ~= "string" or not base:match("^https?://[%w%.%-:]+$") then
     return nil, "apiBase must look like https://api.example.com (no path)"
   end
@@ -355,6 +358,15 @@ local function httpForCore(method, path, body, callback)
     curlStart(method, path, body, callback)
     return
   end
+  if
+    (path == "/v1/mod/settings" or path == "/v1/mod/config" or path == "/v1/mod/heartbeat") and not shuttingDown
+  then
+    -- Start-up, the settings and the heartbeat run in the background too: BeamMP waits for onInit (and for each
+    -- timer event) and gives up on a plugin that takes too long, and a first request over the internet can be
+    -- slow. The answer is collected a moment later by pollAnswers, so nothing here holds up the server.
+    curlStart(method, path, body, callback)
+    return
+  end
   if path == "/v1/events/game" or path == "/v1/events/batch" then
     -- (A batch sent as the server stops is not waited for: nothing is left to see the answer.)
     curlRequest(method, path, body, false)
@@ -364,6 +376,63 @@ local function httpForCore(method, path, body, callback)
   local wait = path ~= "/v1/events/player-leave"
   local status, response = curlRequest(method, path, body, wait)
   callback(status, response)
+end
+
+-- The shield and the first lines the operator sees in the console, printed as soon as the plugin starts.
+-- Fixed text and the API address from config.json: never the key, never anything about a player.
+local SHIELD = {
+  "  ___________",
+  " /     _     \\",
+  "|     / \\     |",
+  "|    / _ \\    |",
+  " \\  /_/ \\_\\  /",
+  "  \\_________/",
+}
+
+local function printStartBanner()
+  local text = {
+    "ServerGuardian for BeamMP",
+    "Version " .. tostring(ServerGuardianCore.VERSION),
+    "API: " .. settings.base,
+    "Connecting in the background...",
+  }
+  print("")
+  for index, art in ipairs(SHIELD) do
+    print(string.format("  %-15s   %s", art, text[index] or ""))
+  end
+  print("")
+end
+
+local function yesNo(value)
+  return value and "on" or "off"
+end
+
+-- Said once, when the first answer (or failure) from the API is in: the result of the start-up connection.
+local function printConnectionResult()
+  local state, detail = guard:connectionStatus()
+  if state == "connected" then
+    local summary = guard:summary()
+    log("info", "CONNECTED: " .. detail)
+    log(
+      "info",
+      string.format(
+        "fail mode %s | game events %s | reports %s | chat checking %s",
+        tostring(summary.failMode),
+        yesNo(summary.gameEvents),
+        yesNo(summary.reports),
+        yesNo(summary.chatModeration)
+      )
+    )
+  else
+    log(
+      "warn",
+      "NOT CONNECTED: "
+        .. tostring(detail or "no answer yet")
+        .. ". Until this works, players are "
+        .. (guard.failMode == "closed" and "kept out (failMode is closed)" or "let in unchecked (failMode is open)")
+        .. ". It will keep trying."
+    )
+  end
 end
 
 function onInit()
@@ -426,9 +495,13 @@ function onInit()
   -- About once a minute the plugin says it is there, with how many players are on, so the portal can
   -- show the server online or offline. It runs whether or not game events or reports are on.
   MP.CreateEventTimer(HEARTBEAT_EVENT, ServerGuardianCore.HEARTBEAT_SECONDS * 1000)
+  printStartBanner()
+  -- Asked for in the background (see httpForCore): onInit returns now, and this runs a moment later from the
+  -- one-second timer, with the answers in.
   guard:refreshConfig(function(ok)
     log("info", ok and "started" or "started with the built-in wording (could not reach the API)")
     sgHeartbeat()
+    printConnectionResult()
   end, true)
 end
 
