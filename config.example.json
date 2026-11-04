@@ -9,6 +9,7 @@
     "gameEvents": false,
     "reports": false,
     "shareBans": true,
-    "youthOriented": false
+    "youthOriented": false,
+    "chatModeration": false
   }
 }

@@ -23,6 +23,7 @@ This server's behaviour is set in **`config.json`, in the `settings` object**, n
 | `reports` | `true` or `false` | `false` | Let players report each other with `/report`. See "Player reports" below. |
 | `shareBans` | `true` or `false` | `true` | Use bans recorded on your other ServerGuardian servers here too, and share this server's bans with them. Turn it off for a server that should keep its own list. Bans reported to other server owners are not affected. |
 | `youthOriented` | `true` or `false` | `false` | This server or event is for players under 18. Their data is handled more strictly: no hardware check, shorter records, and game events are neither kept nor sent on to webhooks. |
+| `chatModeration` | `true` or `false` | `false` | Send chat lines to ServerGuardian to be checked against the rules you set in the portal, and show players the join notice that says so. See "Chat moderation" below. **Off by default.** |
 
 - Use JSON `true` and `false` without quotes.
 - **Any setting you leave out keeps the value it already had**, so an older config file never changes a server's youth-oriented protection or anything else.
@@ -36,6 +37,18 @@ On join the plugin shows the ServerGuardian notice, sends the player's BeamMP ac
 
 
 **Heartbeat.** About once a minute (and once at start-up) the plugin tells ServerGuardian it is there and how many players are on, so the portal can show the server as online or offline. The count is the only thing sent, it is never logged, and it runs whether or not game events or reports are on. BeamMP waits for the answer (with the usual time limit), at most one at a time. A refused key, plan or permission pauses it for ten minutes, too many requests for one.
+
+## Chat moderation
+
+Off unless **`chatModeration`** is `true` in `settings` (the default is off; the portal shows the setting but cannot change it). While it is off the plugin does nothing with chat. While it is on:
+
+- **What is sent:** each chat line a player types (not commands: anything starting with `/` is never queued, and empty lines are not), cut to 500 characters, with the id of that player's join (the reference ServerGuardian already has) and a short label, the player's in-game name with only letters, digits, spaces and `_ . : / -` kept. A line from a player who has no join reference yet is dropped. Lines go to `POST /v1/chat` in groups of up to 50, at most every five seconds. **What is never sent:** an IP address, a platform id, a hardware id, or anything else.
+- **What ServerGuardian does with it** is described in the portal: it reads each line in memory, keeps only the lines that break a rule you turned on, and forgets the rest.
+- **The plugin never writes chat anywhere.** Not to disk (the request body goes to curl through a pipe, not a temporary file, unlike every other request), not to the console and not to the log, and no error message ever includes it. Lines wait in memory only, at most 500 (the oldest are dropped first, and only a count is logged, at debug level) and for at most a minute, and are never kept for a retry.
+- **Chat is never slowed, changed or cancelled.** `onChatMessage` only puts the line in the queue and returns nothing (it returns `1` only for `/report`, as before), so other plugins and the server see no difference. Sending happens from the one-second timer, in the background.
+- **Honouring the answer.** If ServerGuardian answers that chat checking is off for this server (`enabled: false`), the plugin queues nothing more until the next settings refresh (every ten minutes) reads the switch as on. Any error (a `429`, a `5xx`, no answer, a `401`, `402`, `403` or `404`, including `chat_moderation_disabled`) backs off (`Retry-After` or a minute for a `429`; 5 seconds then longer, up to a minute, for a server error or no answer; ten minutes for `401`, `402`, `403` and `404`), and the lines that were in that request, and any waiting, are **discarded**: nothing is retried. While backing off, chat is not queued at all.
+- **The join notice.** While chat moderation is on, the plugin shows the `noticeChat` wording from ServerGuardian's settings instead of the usual notice (which says chat is not read). If ServerGuardian does not supply `noticeChat`, the usual notice is shown **and no chat is sent**, so players are never told chat is not read while it is.
+- **Not verified:** the Windows branch of the pipe (`start /b` with curl reading its standard input) has not been run on Windows. If it does not work no answer arrives and the lines are simply lost. The hook was checked against the BeamMP-Server source (`TServer.cpp`: `onChatMessage(senderID, senderName, message)`, a handler's return of `1` rejects the message); it was **not run on a real BeamMP server**.
 
 ## Recording bans and kicks
 
@@ -84,6 +97,6 @@ When **`gameEvents`** is `true` in `settings` (off by default), the plugin tells
 
 `sg_core.lua` is shared with the [FiveM resource](https://github.com/ServerGuardian/FiveM_Plugin). **This repository is where it is edited.** After a change, run `./sync-core.sh` (it copies to `../FiveM_Plugin`) and commit there too.
 
-The end-to-end tests run this plugin against the real API, so they live in [Backend](https://github.com/ServerGuardian/Backend) (`tests/mods.beammp.e2e.test.ts`), with the fake BeamMP and FiveM environments. Check this repository out next to Backend as `../BeamMP_Plugin` and run `pnpm test` there. Needs `lua` and `curl`. The game-event checks in the core also have their own tests with made-up positions (`tests/mods.game-core.test.ts`).
+The end-to-end tests run this plugin against the real API, so they live in [Backend](https://github.com/ServerGuardian/Backend) (`tests/mods.beammp.e2e.test.ts`), with the fake BeamMP and FiveM environments. Check this repository out next to Backend as `../BeamMP_Plugin` and run `pnpm test` there. Needs `lua` and `curl`. The game-event checks in the core also have their own tests with made-up positions (`tests/mods.game-core.test.ts`), and the chat part of the core has its own (`tests/mod-kit/chat_core_test.lua`, run by `tests/mods.chat-core.test.ts`). `tests/mod-kit/beammp_chat.e2e.test.mjs` runs `main.lua` under the fake BeamMP with real curl against a small fake API (no database: `node --test tests/mod-kit/beammp_chat.e2e.test.mjs`); it checks what `onChatMessage` returns, that chat never reaches a file or a command line, and what is sent.
 
 The earlier 2025 BeamMP resource is kept on the `legacy-2025` branch.

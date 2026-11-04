@@ -15,10 +15,15 @@
 --     a coordinate, chat, an address or a platform id. The movement checks run here, on the game
 --     server, and send only a flag. Events are held for a few seconds and sent in groups; a group is
 --     only a list of those same events;
---   * the server's settings (fail mode, game events, reports, shared bans, youth-oriented) are set in the
---     platform's config file; they are sent to the API as five yes/no or open/closed values and nothing
---     else, and only those the file actually sets (a missing one is never sent, so an older config
---     file cannot reset what the server had);
+--   * chat moderation (decision D45) is OFF unless the server's settings turn it on. When on, a chat
+--     line (not a command, cut to 500 characters) is held in memory only and sent, with the id of the
+--     player's join and a short label, to POST /v1/chat in groups of up to 50. Chat text is never
+--     written to disk, the console or the log (not even in an error message), is never kept for a
+--     retry, and is never part of anything but that one request body;
+--   * the server's settings (fail mode, game events, reports, shared bans, youth-oriented, chat
+--     moderation) are set in the platform's config file; they are sent to the API as six yes/no or
+--     open/closed values and nothing else, and only those the file actually sets (a missing one is never
+--     sent, so an older config file cannot reset what the server had);
 --   * the heartbeat (about once a minute, so the portal can show the server online or offline) carries
 --     one whole number, how many players are on, and nothing else;
 --   * a blocked player is told only the fixed wording from the API, never why.
@@ -26,7 +31,7 @@
 ServerGuardianCore = ServerGuardianCore or {}
 local M = ServerGuardianCore
 
-M.VERSION = "0.8.0"
+M.VERSION = "0.9.0"
 
 -- Used until the API has been reached once, and whenever it cannot be. Kept short on purpose: the
 -- authoritative wording comes from GET /v1/mod/config so operators cannot change it.
@@ -122,6 +127,17 @@ local HEARTBEAT_MIN_SECONDS = 55
 local HEARTBEAT_BACKOFF_SECONDS = 60
 local HEARTBEAT_REFUSED_BACKOFF_SECONDS = 600
 local MAX_HEARTBEAT_PLAYERS = 100000
+-- Chat moderation (decision D45). The API takes 1 to 50 lines of 1 to 500 characters in one request.
+local CHAT_MAX_CHARS = 500
+local CHAT_BATCH_MAX = 50
+local CHAT_QUEUE_CAP = 500 -- lines held at most; the oldest go first
+local CHAT_FLUSH_SECONDS = 5 -- a line waits at most this long (from the tick) before it is sent
+local CHAT_QUEUE_MAX_AGE_SECONDS = 60 -- a line this old is dropped, never kept for later
+local CHAT_RETRY_FIRST_SECONDS = 5 -- after a 5xx or no answer; doubles each time up to the next
+local CHAT_RETRY_MAX_SECONDS = 60
+local CHAT_BACKOFF_SECONDS = 60 -- after a 429 without a Retry-After, or a 4xx the API will not change its mind about
+local CHAT_REFUSED_BACKOFF_SECONDS = 600 -- after a 401, 402, 403 or 404: the key, the plan or the feature is not usable
+local CHAT_HOLD_MAX_SECONDS = 600 -- the longest a Retry-After is believed
 local GAME_CONFIG_MAX_AGE_SECONDS = 10800 -- game events switch themselves off if settings cannot be refreshed for this long
 local MIN_SAMPLE_SECONDS = 1
 local MAX_SAMPLE_SECONDS = 10
@@ -302,7 +318,7 @@ end
 
 -- The settings a server's config file may hold (decision D41 follow-up). The portal shows them but
 -- cannot change them.
-local SETTING_NAMES = { "failMode", "gameEvents", "reports", "shareBans", "youthOriented" }
+local SETTING_NAMES = { "failMode", "gameEvents", "reports", "shareBans", "youthOriented", "chatModeration" }
 local KNOWN_SETTING = {}
 for _, name in ipairs(SETTING_NAMES) do
   KNOWN_SETTING[name] = true
@@ -347,7 +363,8 @@ end
 -- opts.failMode      "open" (default) or "closed": what to do until the API has answered, and the
 --                    answer the portal used to give; opts.settings.failMode, when set, always wins
 -- opts.settings      the config file's settings: { failMode, gameEvents, reports, shareBans,
---                    youthOriented }, each optional; invalid ones are ignored (see cleanSettings)
+--                    youthOriented, chatModeration }, each optional; invalid ones are ignored (see
+--                    cleanSettings)
 -- opts.http          function(method, path, bodyTable_or_nil, callback) ; callback(status, bodyString)
 --                    status is nil when the request failed or timed out
 -- opts.json          { encode = fn, decode = fn }
@@ -401,6 +418,15 @@ function M.new(opts)
   self.gameRejectLoggedAt = nil
   self.tracker = M.newTracker()
   self.onGameConfig = nil -- set by the platform: called when game events are switched on or off
+  -- Chat moderation (decision D45). Off until the settings say on (and the API has served the chat notice).
+  self.chatEnabled = false -- the server's switch, as last read
+  self.chatAnswerOff = false -- the API answered `enabled: false`: stay quiet until the switch is next read as on
+  self.chatQueue = {} -- lines waiting, oldest first: { body = the line, at = self.clock() }. Memory only.
+  self.chatInFlight = false
+  self.chatBackoffUntil = 0 -- self.clock() time before which no line is queued or sent
+  self.chatRetryFails = 0
+  self.chatDropped = 0 -- lines dropped since the last debug line about it (a count: never any text)
+  self.chatNoticeWarned = false
   self.configFetchedAt = nil
   self.counter = 0
   self.stats = { checks = 0, passes = 0, blocks = 0, errors = 0, skipped = 0 }
@@ -526,6 +552,10 @@ function Guard:_fetchConfig(now, callback)
           optInNo = en.optInNo or M.DEFAULT_WORDING.optInNo,
           blocked = en.blocked,
           links = type(decoded.links) == "table" and decoded.links or {},
+          -- Shown instead of `notice` while the chat check is on. Absent from an API that has no chat check.
+          noticeChat = (type(en.noticeChat) == "string" and en.noticeChat ~= "" and en.noticeChat)
+            or (type(decoded.noticeChat) == "string" and decoded.noticeChat ~= "" and decoded.noticeChat)
+            or nil,
         }
         -- The config file wins; the API's answer is for servers whose file does not set it.
         if
@@ -559,6 +589,14 @@ function Guard:_fetchConfig(now, callback)
           }
         end
         self:_setGameConfig(gameSettings)
+        -- The chat switch follows the same rule as reports: the config file wins, else the API's answer.
+        local chatOn
+        if self.localSettings.chatModeration ~= nil then
+          chatOn = self.localSettings.chatModeration
+        else
+          chatOn = type(decoded.chatModeration) == "table" and decoded.chatModeration.enabled == true
+        end
+        self:_applyChatConfig(chatOn)
         self.configFetchedAt = now
         ok = true
       end
@@ -569,6 +607,7 @@ function Guard:_fetchConfig(now, callback)
       -- events are off. A failure to get an answer at all keeps what we had, which times out below.
       if status == 401 or status == 402 or status == 403 then
         self:_applyGameConfig(false, nil)
+        self:_applyChatConfig(false)
       end
     end
     if callback then
@@ -1422,6 +1461,7 @@ end
 -- the oldest event has waited `flushSeconds`, or the queue holds a full batch. Does nothing when game
 -- events are off, not batched, or nothing is waiting.
 function Guard:tick()
+  self:_tickChat()
   self:_dropStale()
   self:_reportDrops()
   local batch = self.gameBatch
@@ -1438,6 +1478,8 @@ end
 -- Best effort, and the answer is not waited for.
 function Guard:flushGameEvents()
   self:_flushGame()
+  -- Chat is not sent on the way out: what is waiting is discarded, never kept.
+  self.chatQueue = {}
 end
 
 --- A player spawned something (`item` is its short name). Sent only if game events are on.
@@ -1494,6 +1536,232 @@ function Guard:samplePosition(playerKey, key, joinEventId, label, x, y, z)
       check = flag.check,
       severity = flag.severity,
     })
+  end
+end
+
+-- ---------------------------------------------------------------------------------------------------
+-- Chat moderation (decision D45). The platform hands each chat line to Guard:chatLine, which only
+-- puts it in a queue in memory: it never makes a request, so it cannot hold up the game's chat. The
+-- tick sends what is waiting to POST /v1/chat. A line is never written anywhere, never logged (not
+-- even in an error), and never kept for a retry: if a request fails, what it carried is gone.
+-- ---------------------------------------------------------------------------------------------------
+
+--- The text of a chat line as it may be sent: no control characters, no leading or trailing space,
+-- valid UTF-8, at most CHAT_MAX_CHARS characters. nil for something that is not a line of chat: not a
+-- string, empty, or a command (it starts with "/"). Commands are never queued.
+local function chatText(text)
+  if type(text) ~= "string" then
+    return nil
+  end
+  text = text:gsub("%c", " "):match("^%s*(.-)%s*$")
+  if text == "" or text:sub(1, 1) == "/" then
+    return nil
+  end
+  local length = utf8.len(text)
+  if not length then
+    text = text:gsub("[\128-\255]", "?") -- not valid UTF-8 (it could not be sent as JSON): keep the ASCII
+    length = #text
+  end
+  if length > CHAT_MAX_CHARS then
+    text = text:sub(1, utf8.offset(text, CHAT_MAX_CHARS + 1) - 1)
+  end
+  text = text:match("^(.-)%s*$")
+  if text == "" then
+    return nil
+  end
+  return text
+end
+M.chatText = chatText
+
+--- Whether the chat check is on for this server (the switch as last read from the settings).
+function Guard:chatOn()
+  return self.chatEnabled
+end
+
+--- True while chat lines may be queued and sent: the switch is on and the API has not said otherwise,
+-- the API has served the chat notice (players are told before anything is read), it is not backing
+-- off, and the settings are not stale.
+function Guard:_chatActive()
+  if not self.chatEnabled or self.chatAnswerOff or not self.wording.noticeChat then
+    return false
+  end
+  if self.clock() < self.chatBackoffUntil then
+    return false
+  end
+  if self.configFetchedAt and self.now() - self.configFetchedAt > GAME_CONFIG_MAX_AGE_SECONDS then
+    return false -- we have not been able to confirm the operator still wants it
+  end
+  return true
+end
+
+--- The join notice to show: the chat-checking variant while the chat check is on for this server (and
+-- the API has served it), else the usual one.
+function Guard:noticeText()
+  if self.chatEnabled and self.wording.noticeChat then
+    return self.wording.noticeChat
+  end
+  return self.wording.notice
+end
+
+--- Takes the switch as read from the settings. Off empties the queue; on clears a stop that an
+-- `enabled: false` answer caused (the switch has now been read as on).
+function Guard:_applyChatConfig(enabled)
+  self.chatEnabled = enabled == true
+  if self.chatEnabled then
+    self.chatAnswerOff = false
+    if not self.wording.noticeChat and not self.chatNoticeWarned then
+      self.chatNoticeWarned = true
+      self.log("warn", "chat checking is on but ServerGuardian did not supply the chat notice, so no chat is sent")
+    end
+  else
+    self.chatQueue = {}
+    self.chatNoticeWarned = false
+  end
+end
+
+function Guard:_chatEventId()
+  self.counter = self.counter + 1
+  return string.format("ch-%s-%x-%x", self.prefix, self.now(), self.counter)
+end
+
+--- A line of chat was said. Queued only while the chat check is on, and only if it is a line of chat
+-- (not a command, not empty) from a player who has a join reference. Does nothing else: no request,
+-- no log, nothing written. Returns true if the line was queued. The text is cut to 500 characters.
+function Guard:chatLine(joinEventId, label, text)
+  if not self:_chatActive() then
+    return false
+  end
+  if type(joinEventId) ~= "string" or joinEventId == "" then
+    return false -- no join reference yet: dropped
+  end
+  local clean = chatText(text)
+  if not clean then
+    return false
+  end
+  self:_dropStaleChat()
+  self.chatQueue[#self.chatQueue + 1] = {
+    body = {
+      eventId = self:_chatEventId(),
+      joinEventId = joinEventId,
+      label = gameText(label, MAX_LABEL),
+      text = clean,
+    },
+    at = self.clock(),
+  }
+  local over = #self.chatQueue - CHAT_QUEUE_CAP
+  if over > 0 then
+    self.chatQueue = table.move(self.chatQueue, over + 1, #self.chatQueue, 1, {})
+    self.chatDropped = self.chatDropped + over
+  end
+  return true
+end
+
+--- Drops lines that have waited too long. Chat is never kept for later.
+function Guard:_dropStaleChat()
+  local queue = self.chatQueue
+  local now = self.clock()
+  local stale = 0
+  while queue[stale + 1] and now - queue[stale + 1].at > CHAT_QUEUE_MAX_AGE_SECONDS do
+    stale = stale + 1
+  end
+  if stale > 0 then
+    self.chatQueue = table.move(queue, stale + 1, #queue, 1, {})
+    self.chatDropped = self.chatDropped + stale
+  end
+end
+
+--- Called from the tick: sends what is waiting once a full group has built up or the oldest line has
+-- waited CHAT_FLUSH_SECONDS. Also says, in a count, how many lines were dropped.
+function Guard:_tickChat()
+  self:_dropStaleChat()
+  if self.chatDropped > 0 then
+    self.log("debug", "dropped " .. self.chatDropped .. " chat lines (the queue was full, or they were too old)")
+    self.chatDropped = 0
+  end
+  local oldest = self.chatQueue[1]
+  if not oldest then
+    return
+  end
+  if #self.chatQueue >= CHAT_BATCH_MAX or self.clock() - oldest.at >= CHAT_FLUSH_SECONDS then
+    self:_flushChat()
+  end
+end
+
+--- Waits before the next request: the lines are not queued meanwhile, and the ones waiting are gone.
+function Guard:_holdChat(seconds)
+  self.chatBackoffUntil = self.clock() + seconds
+  self.chatDropped = self.chatDropped + #self.chatQueue
+  self.chatQueue = {}
+end
+
+--- Sends up to 50 of the waiting lines in one request, if one is not already on its way. The lines
+-- leave the queue before the request is made, so nothing can send them twice or keep them for later.
+function Guard:_flushChat()
+  if self.chatInFlight or #self.chatQueue == 0 then
+    return
+  end
+  if not self:_chatActive() then
+    self.chatQueue = {} -- off, backing off or stale: what is waiting is not sent later
+    return
+  end
+  local count = math.min(#self.chatQueue, CHAT_BATCH_MAX)
+  local taken = table.move(self.chatQueue, 1, count, 1, {})
+  self.chatQueue = table.move(self.chatQueue, count + 1, #self.chatQueue, 1, {})
+  local messages = {}
+  for i, entry in ipairs(taken) do
+    messages[i] = entry.body
+  end
+  self.chatInFlight = true
+  -- The error of a failed start is not kept or logged: it could hold part of the request.
+  local started = pcall(self.http, "POST", "/v1/chat", { messages = messages }, function(status, responseBody, headers)
+    self.chatInFlight = false
+    self:_chatAnswered(status, responseBody, headers)
+  end)
+  if not started then
+    -- The platform could not even start the request: the lines are dropped, not kept.
+    self.chatInFlight = false
+    self.chatDropped = self.chatDropped + count
+    self:_holdChat(CHAT_RETRY_FIRST_SECONDS)
+  end
+end
+
+--- What to do once the API has answered (or not). Whatever the answer, the lines that were sent are
+-- gone. Only the status is logged.
+function Guard:_chatAnswered(status, responseBody, headers)
+  if status == 200 then
+    self.chatRetryFails = 0
+    local decoded = type(responseBody) == "string" and responseBody ~= "" and self:_decode(responseBody) or nil
+    if decoded and decoded.enabled == false then
+      -- The operator's switch for this server is off: stay quiet until it is next read as on.
+      self.chatAnswerOff = true
+      self.chatQueue = {}
+    end
+    return
+  end
+  self.log("debug", "could not send chat (status " .. tostring(status) .. ")")
+  if status == 429 then
+    local wait = tonumber(headerOf(headers, "retry-after"))
+    if not positive(wait) then
+      wait = CHAT_BACKOFF_SECONDS
+    end
+    self:_holdChat(math.min(CHAT_HOLD_MAX_SECONDS, wait))
+  elseif status == 401 or status == 402 or status == 403 then
+    self:_holdChat(CHAT_REFUSED_BACKOFF_SECONDS)
+  elseif status == 404 then
+    local decoded = type(responseBody) == "string" and self:_decode(responseBody) or nil
+    if decoded and decoded.error == "chat_moderation_disabled" then
+      -- The feature is off for the whole service: off until the switch is next read as on.
+      self.chatAnswerOff = true
+    end
+    self:_holdChat(CHAT_REFUSED_BACKOFF_SECONDS)
+  elseif status == nil or status >= 500 then
+    -- No answer, or the API is struggling: back off a little longer each time (the lines are not kept).
+    local wait = math.min(CHAT_RETRY_MAX_SECONDS, CHAT_RETRY_FIRST_SECONDS * 2 ^ self.chatRetryFails)
+    self.chatRetryFails = self.chatRetryFails + 1
+    self:_holdChat(wait)
+  else
+    -- A 400, 413, 422 ...: trying again would be refused again.
+    self:_holdChat(CHAT_BACKOFF_SECONDS)
   end
 end
 

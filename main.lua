@@ -18,6 +18,11 @@
 -- are held for a few seconds and sent together. Positions never leave the server. A flag is a prompt
 -- for a person to look: nothing is ever kicked or banned because of it.
 --
+-- When the server owner turns chat moderation on (the `chatModeration` setting in config.json, off by
+-- default), the plugin also hands each chat line (not commands) to ServerGuardian, in groups, from a
+-- queue in memory. It never blocks, changes or cancels chat, never writes chat to disk, the console or
+-- the log, and shows the join notice that says chat is checked instead of the usual one.
+--
 -- BeamMP's Lua has no HTTP client we can use (Http.CreateConnection only issues a GET and returns
 -- nothing), so this plugin calls curl. curl must be installed and on the PATH (or set curlPath).
 -- BeamMP exposes no hardware id, so this plugin never sends one.
@@ -118,8 +123,10 @@ local isWindows = package.config:sub(1, 1) == "\\"
 -- here: the request body goes through a file so nothing a player controls (such as a name) is ever
 -- part of a shell command, and the key goes through a curl config file so it does not show up in the
 -- process list. Returns the line and the names of the files it uses, or nil if the body cannot be
--- written. `headers` makes curl keep the answer's headers in a file too.
-local function curlCommand(method, path, body, headers)
+-- written. `headers` makes curl keep the answer's headers in a file too. With `stdin` the body is NOT
+-- written to a file: curl is told to read it from its standard input (see curlStartChat), which is how
+-- chat is sent, because chat must never be written to disk, even for a moment.
+local function curlCommand(method, path, body, headers, stdin)
   local id = string.format("%x%x", os.time(), math.random(0, 0xfffff))
   local work = settings.dir .. "/work"
   local files = {
@@ -148,7 +155,12 @@ local function curlCommand(method, path, body, headers)
     command[#command + 1] = "-D"
     command[#command + 1] = '"' .. files.headers .. '"'
   end
-  if body then
+  if body and stdin then
+    command[#command + 1] = "-H"
+    command[#command + 1] = '"content-type: application/json"'
+    command[#command + 1] = "--data-binary"
+    command[#command + 1] = '"@-"'
+  elseif body then
     local file = io.open(files.body, "wb")
     if not file then
       return nil
@@ -227,6 +239,48 @@ local function curlStart(method, path, body, callback)
   pendingAnswers[#pendingAnswers + 1] = { files = files, callback = callback, giveUpAt = os.time() + settings.timeout + 10 }
 end
 
+-- Starts a request whose body goes to curl through a pipe, so it is never written to disk: used for chat
+-- only. Like curlStart it returns at once and the answer is collected by pollAnswers. On Linux and macOS a
+-- shell keeps the read end of the pipe (descriptor 3) and `cat` copies it to curl in the background; `cat`
+-- always reads to the end, so writing here can never hit a closed pipe (which would raise SIGPIPE) even if
+-- curl cannot start. The command line holds no chat: the text only travels through the pipe. On Windows
+-- the same is done with `start /b` and curl reading its standard input: NOT verified on Windows (BeamMP
+-- Windows servers have not been tried); if it does not work, no answer ever arrives and the lines are
+-- simply lost, which is the safe way for it to fail.
+local function curlStartChat(method, path, body, callback)
+  local line, files = curlCommand(method, path, body, true, true)
+  if not line then
+    callback(nil)
+    return
+  end
+  local encoded = nil
+  if body then
+    local ok, text = pcall(Util.JsonEncode, body)
+    encoded = ok and type(text) == "string" and text or nil
+  end
+  if not encoded then
+    callback(nil)
+    return
+  end
+  local status = files.status
+  local command
+  if isWindows then
+    command = 'start "" /b cmd /c "' .. line:gsub('"', '""') .. ' > ""' .. status .. '.tmp"" 2>NUL & move /y ""' .. status
+      .. '.tmp"" ""' .. status .. '"" >NUL" >NUL 2>&1'
+  else
+    command = "exec 3<&0; ( cat <&3 | " .. line .. ' > "' .. status .. '.tmp" 2>/dev/null ; mv -f "' .. status .. '.tmp" "'
+      .. status .. '" ) >/dev/null 2>&1 &'
+  end
+  local handle = io.popen(command, "w")
+  if not handle then
+    callback(nil)
+    return
+  end
+  handle:write(encoded)
+  handle:close()
+  pendingAnswers[#pendingAnswers + 1] = { files = files, callback = callback, giveUpAt = os.time() + settings.timeout + 10 }
+end
+
 -- The headers curl kept, as a table of lowercase names (only the last answer's, if there were several).
 local function readHeaders(path)
   local headers = {}
@@ -287,6 +341,16 @@ local function httpForCore(method, path, body, callback)
   -- as sent: the plugin cannot see the answer, and relies on its own limits and the settings refresh
   -- every ten minutes (which says if the operator has switched game events off, or the key no longer
   -- works). A batch is seen: a 429, a refusal or a failure is acted on, by the core.
+  if path == "/v1/chat" then
+    -- Chat is only ever sent in the background through a pipe (never a file), and not at all while the
+    -- server stops: nothing is left to see the answer, and chat is not kept for later.
+    if shuttingDown then
+      callback(nil)
+      return
+    end
+    curlStartChat(method, path, body, callback)
+    return
+  end
   if path == "/v1/events/batch" and not shuttingDown then
     curlStart(method, path, body, callback)
     return
@@ -430,7 +494,7 @@ end
 -- Shows the notice. Returns false if it could not be delivered (for example the player is not yet
 -- fully loaded): we do not send anything about a player who has not been told.
 local function showNotice(playerID)
-  for _, part in ipairs(chunks(guard.wording.notice, 180)) do
+  for _, part in ipairs(chunks(guard:noticeText(), 180)) do
     local sent = false
     for _ = 1, 3 do
       local ok = MP.SendChatMessage(playerID, part)
@@ -739,16 +803,35 @@ local function handleReport(playerID, rest)
   end)
 end
 
-function onChatMessage(playerID, _playerName, message)
+-- Hands a chat line to the chat check, if it is on: the line only goes into a queue in memory (the core
+-- sends it later, from the timer), so this takes no time. Guarded, so nothing it does can reach chat. An
+-- error is not logged: its text could hold the line.
+local function queueChat(playerID, playerName, message)
+  local ok = pcall(function()
+    guard:chatLine(joins[playerID], playerName, message)
+  end)
+  if not ok then
+    log("warn", "a chat line could not be handed to the chat check")
+  end
+end
+
+-- BeamMP-Server (TServer.cpp) calls every plugin's onChatMessage(senderID, senderName, message) and
+-- waits for them; a handler that returns 1 stops the message being shown to anyone. This one returns 1
+-- only for /report. For everything else it returns nothing, so other plugins and the server see no
+-- change: chat is never cancelled, altered or delayed by the chat check.
+function onChatMessage(playerID, playerName, message)
   if not guard or type(message) ~= "string" then
     return nil
   end
   local word, rest = message:match("^%s*/(%S+)%s*(.-)%s*$")
-  if not word or word:lower() ~= "report" then
-    return nil
+  if word and word:lower() == "report" then
+    handleReport(playerID, rest)
+    return 1
   end
-  handleReport(playerID, rest)
-  return 1
+  if guard:chatOn() then
+    queueChat(playerID, playerName, message)
+  end
+  return nil
 end
 
 -- ---------------------------------------------------------------------------------------------------
