@@ -17,12 +17,17 @@ Players with a BeamMP guest session have no account id, so they cannot be checke
 The plugin prints a shield, its version and the API address to the server console as soon as it loads, then a line saying whether it reached ServerGuardian a moment later:
 
 ```
-  ___________       ServerGuardian for BeamMP
- /     _     \      Version 0.9.1
-|     / \     |     API: https://test.example.com
-|    / _ \    |     Connecting in the background...
- \  /_/ \_\  /
-  \_________/
+             _
+       _.--'' ''--._
+      |         /   |
+      |        /    |       ServerGuardian for BeamMP
+      |   \   /     |       Version 0.9.1
+      |    \ /      |       API: https://test.example.com
+      |     V       |       Connecting in the background...
+       \           /
+        \         /
+         '.     .'
+           '-_-'
 
 [ServerGuardian] info: started
 [ServerGuardian] info: CONNECTED: connected, API key accepted

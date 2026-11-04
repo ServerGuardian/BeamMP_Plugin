@@ -381,24 +381,29 @@ end
 -- The shield and the first lines the operator sees in the console, printed as soon as the plugin starts.
 -- Fixed text and the API address from config.json: never the key, never anything about a player.
 local SHIELD = {
-  "  ___________",
-  " /     _     \\",
-  "|     / \\     |",
-  "|    / _ \\    |",
-  " \\  /_/ \\_\\  /",
-  "  \\_________/",
+  "           _",
+  "     _.--'' ''--._",
+  "    |         /   |",
+  "    |        /    |",
+  "    |   \\   /     |",
+  "    |    \\ /      |",
+  "    |     V       |",
+  "     \\           /",
+  "      \\         /",
+  "       '.     .'",
+  "         '-_-'",
 }
 
 local function printStartBanner()
   local text = {
-    "ServerGuardian for BeamMP",
-    "Version " .. tostring(ServerGuardianCore.VERSION),
-    "API: " .. settings.base,
-    "Connecting in the background...",
+    [4] = "ServerGuardian for BeamMP",
+    [5] = "Version " .. tostring(ServerGuardianCore.VERSION),
+    [6] = "API: " .. settings.base,
+    [7] = "Connecting in the background...",
   }
   print("")
   for index, art in ipairs(SHIELD) do
-    print(string.format("  %-15s   %s", art, text[index] or ""))
+    print((string.format("  %-23s   %s", art, text[index] or ""):gsub("%s+$", "")))
   end
   print("")
 end
