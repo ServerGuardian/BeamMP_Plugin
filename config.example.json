@@ -2,6 +2,8 @@
   "apiBase": "https://api.serverguardian.example",
   "apiKey": "sg_xxxxxxxx_paste-your-key-here",
   "timeoutSeconds": 3,
+  "noticeDelaySeconds": 15,
+  "bannerStyle": "auto",
   "curlPath": "curl",
   "recordKicks": false,
   "settings": {

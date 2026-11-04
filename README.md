@@ -12,22 +12,30 @@ A BeamMP server plugin that asks ServerGuardian whether a joining player is link
 
 Players with a BeamMP guest session have no account id, so they cannot be checked or banned; they are let in and nothing is sent. That makes guests a way around any ban. To refuse them, set `AllowGuests = false` under `[General]` in BeamMP's `ServerConfig.toml` (or `BEAMMP_ALLOW_GUESTS=false`): it is BeamMP's own setting, and your choice.
 
+## When a player is shown the notice, and checked
+
+BeamMP raises `onPlayerJoin` when a player *starts* syncing: their game is still loading the map and the other players' cars, and a chat line sent then is not seen (BeamMP has no event for "finished loading"). So the plugin waits: the player is shown the ServerGuardian notice, and only then checked, as soon as **their first car spawns or they first say something** (they are certainly in the game then), or **15 seconds after they joined**, whichever comes first. Nothing is sent about a player before the notice. Change the 15 with `noticeDelaySeconds` in `config.json` (0 to 120; 0 restores the old behaviour of acting at once). A player who leaves before then is simply forgotten.
+
+The price is that a banned player is removed after that wait (up to 15 seconds, or sooner when they spawn a car) instead of at the instant they join. A server that would rather check at once, accepting that the notice may be missed, can set 0.
+
 ## What you see when it starts
 
-The plugin prints a shield, its version and the API address to the server console as soon as it loads, then a line saying whether it reached ServerGuardian a moment later:
+The plugin prints the ServerGuardian badge, its version and the API address to the server console as soon as it loads, then lines saying whether it reached ServerGuardian a moment later. The badge is drawn in braille dots, which need a console that shows UTF-8; on Windows, or with `"bannerStyle": "ascii"` in `config.json`, a plain-ASCII badge is used instead (`"braille"` forces the dots, `"auto"` is the default):
 
 ```
-             _
-       _.--'' ''--._
-      |         /   |
-      |        /    |       ServerGuardian for BeamMP
-      |   \   /     |       Version 0.9.1
-      |    \ /      |       API: https://test.example.com
-      |     V       |       Connecting in the background...
-       \           /
-        \         /
-         '.     .'
-           '-_-'
+  ⠀⠀⠀⠀⠀⢀⣠⣤⣶⠿⠿⣶⣤⣄⡀⠀⠀⠀⠀⠀
+  ⢀⣀⣤⣶⡾⠟⠛⠉⠀⠀⠀⠀⠉⠛⠻⢷⣶⣤⣀⡀
+  ⣿⡟⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⢻⣿
+  ⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⣿
+  ⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⣄⠀⠀⠀⢸⣿   ServerGuardian for BeamMP
+  ⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣾⡿⠃⠀⠀⠀⢸⣿   Version 0.9.1
+  ⣿⡇⠀⠀⠀⠺⣷⣄⠀⢀⣴⡿⠋⠀⠀⠀⠀⠀⢸⣿   API: https://test.example.com
+  ⢻⣇⠀⠀⠀⠀⠘⢿⣷⣿⠋⠀⠀⠀⠀⠀⠀⠀⣸⡟   Connecting in the background...
+  ⠈⣿⡆⠀⠀⠀⠀⠀⠉⠁⠀⠀⠀⠀⠀⠀⠀⢰⣿⠁
+  ⠀⠘⢿⣆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣰⡿⠃⠀
+  ⠀⠀⠈⠻⣷⣄⠀⠀⠀⠀⠀⠀⠀⠀⣠⣾⠟⠁⠀⠀
+  ⠀⠀⠀⠀⠈⠻⣷⣤⡀⠀⠀⢀⣤⣾⠟⠁⠀⠀⠀⠀
+  ⠀⠀⠀⠀⠀⠀⠀⠙⠻⣷⣾⠟⠋⠀⠀⠀⠀⠀⠀⠀
 
 [ServerGuardian] info: started
 [ServerGuardian] info: CONNECTED: connected, API key accepted

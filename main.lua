@@ -33,6 +33,10 @@ local DEFAULT_DIR = "Resources/Server/ServerGuardian"
 local guard = nil -- the ServerGuardianCore instance, created in onInit
 local settings = nil
 local joins = {} -- playerID -> eventId of the join we checked
+-- playerID -> { readyAt, ip, platformIds }: a player who has joined and has not yet been shown the notice or
+-- checked, because their game is probably still loading (see loadSettings, noticeDelaySeconds).
+local waiting = {}
+local releasePlayer, releaseWaiting -- defined below, used by timers and handlers that come before them
 -- playerID -> { [vehicleID] = model name }, for the movement checks and so a delete (which carries no
 -- data) can say what was deleted. Memory only, and forgotten when the player leaves.
 local vehicles = {}
@@ -98,6 +102,19 @@ local function loadSettings()
   if not curl:match("^[%w%./\\:%-_ ]+$") then
     return nil, "curlPath contains characters that are not allowed"
   end
+  -- How long after a player joins their notice is shown and they are checked, unless they spawn a car or
+  -- say something first. BeamMP raises onPlayerJoin when the player STARTS syncing: their game is still
+  -- loading, and a chat line sent then is not seen. There is no event for "finished loading".
+  local noticeDelay = tonumber(decoded.noticeDelaySeconds) or 15
+  if noticeDelay < 0 then
+    noticeDelay = 0
+  elseif noticeDelay > 120 then
+    noticeDelay = 120
+  end
+  local bannerStyle = decoded.bannerStyle
+  if bannerStyle ~= "braille" and bannerStyle ~= "ascii" then
+    bannerStyle = "auto"
+  end
   local timeout = tonumber(decoded.timeoutSeconds) or 3
   if timeout < 1 then
     timeout = 1
@@ -110,6 +127,8 @@ local function loadSettings()
     base = base,
     curl = curl,
     timeout = timeout,
+    noticeDelay = noticeDelay,
+    bannerStyle = bannerStyle,
     -- The old top-level failMode only matters until the API has answered, as before; the "settings"
     -- block below is what sets the server's behaviour now.
     failMode = decoded.failMode == "closed" and "closed" or "open",
@@ -378,32 +397,62 @@ local function httpForCore(method, path, body, callback)
   callback(status, response)
 end
 
--- The shield and the first lines the operator sees in the console, printed as soon as the plugin starts.
--- Fixed text and the API address from config.json: never the key, never anything about a player.
-local SHIELD = {
-  "           _",
-  "     _.--'' ''--._",
-  "    |         /   |",
-  "    |        /    |",
-  "    |   \\   /     |",
-  "    |    \\ /      |",
-  "    |     V       |",
-  "     \\           /",
-  "      \\         /",
-  "       '.     .'",
-  "         '-_-'",
+-- The badge (the ServerGuardian shield with its check mark) in braille dots, and a plain-ASCII copy for consoles
+-- that cannot show them (a Windows console, by default). bannerStyle in config.json chooses: "auto", "braille", "ascii".
+local SHIELD_BRAILLE = {
+  "⠀⠀⠀⠀⠀⢀⣠⣤⣶⠿⠿⣶⣤⣄⡀⠀⠀⠀⠀⠀",
+  "⢀⣀⣤⣶⡾⠟⠛⠉⠀⠀⠀⠀⠉⠛⠻⢷⣶⣤⣀⡀",
+  "⣿⡟⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⢻⣿",
+  "⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⣿",
+  "⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⣄⠀⠀⠀⢸⣿",
+  "⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣾⡿⠃⠀⠀⠀⢸⣿",
+  "⣿⡇⠀⠀⠀⠺⣷⣄⠀⢀⣴⡿⠋⠀⠀⠀⠀⠀⢸⣿",
+  "⢻⣇⠀⠀⠀⠀⠘⢿⣷⣿⠋⠀⠀⠀⠀⠀⠀⠀⣸⡟",
+  "⠈⣿⡆⠀⠀⠀⠀⠀⠉⠁⠀⠀⠀⠀⠀⠀⠀⢰⣿⠁",
+  "⠀⠘⢿⣆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣰⡿⠃⠀",
+  "⠀⠀⠈⠻⣷⣄⠀⠀⠀⠀⠀⠀⠀⠀⣠⣾⠟⠁⠀⠀",
+  "⠀⠀⠀⠀⠈⠻⣷⣤⡀⠀⠀⢀⣤⣾⠟⠁⠀⠀⠀⠀",
+  "⠀⠀⠀⠀⠀⠀⠀⠙⠻⣷⣾⠟⠋⠀⠀⠀⠀⠀⠀⠀",
+}
+local SHIELD_ASCII = {
+  "             _.-.-._",
+  "         _.-''     ''-._",
+  "     _.-''             ''-._",
+  " _.-''                     ''-._",
+  "|                     /         |",
+  "|                    /          |",
+  "|           \\       /           |",
+  "|            \\     /            |",
+  "|             \\   /             |",
+  " \\             \\ /             /",
+  "  \\             V             /",
+  "   '.                       .'",
+  "     '-._               _.-'",
+  "         '-.__     __.-'",
 }
 
 local function printStartBanner()
   local text = {
-    [4] = "ServerGuardian for BeamMP",
-    [5] = "Version " .. tostring(ServerGuardianCore.VERSION),
-    [6] = "API: " .. settings.base,
-    [7] = "Connecting in the background...",
+    [5] = "ServerGuardian for BeamMP",
+    [6] = "Version " .. tostring(ServerGuardianCore.VERSION),
+    [7] = "API: " .. settings.base,
+    [8] = "Connecting in the background...",
   }
+  local style = settings.bannerStyle
+  if style == "auto" then
+    style = isWindows and "ascii" or "braille"
+  end
+  local art = style == "ascii" and SHIELD_ASCII or SHIELD_BRAILLE
+  -- Every braille row is the same number of characters, so the text lines up without any padding maths on
+  -- multi-byte text; the ASCII rows are padded to the widest.
+  local width = style == "ascii" and 34 or 0
   print("")
-  for index, art in ipairs(SHIELD) do
-    print((string.format("  %-23s   %s", art, text[index] or ""):gsub("%s+$", "")))
+  for index, row in ipairs(art) do
+    local line = "  " .. row
+    if text[index] then
+      line = line .. (style == "ascii" and string.rep(" ", width - #row) or "") .. "   " .. text[index]
+    end
+    print(line)
   end
   print("")
 end
@@ -531,6 +580,7 @@ end
 
 function sgGameFlush()
   if guard then
+    releaseWaiting()
     pollAnswers()
     guard:tick()
   end
@@ -589,6 +639,43 @@ local function showNotice(playerID)
   return true
 end
 
+-- Shows the notice and runs the join check for a player who has been waiting. Called when their first car
+-- spawns or they first speak (so they are certainly in the game), or by the one-second timer once
+-- noticeDelaySeconds have passed, whichever comes first. Nothing is sent about a player before the notice.
+function releasePlayer(playerID)
+  local player = waiting[playerID]
+  if not player or not guard then
+    return
+  end
+  waiting[playerID] = nil
+  if not showNotice(playerID) then
+    log("warn", "the notice could not be shown, so this player was not checked")
+    return
+  end
+  guard:check({ ip = player.ip, platformIds = player.platformIds }, function(decision)
+    joins[playerID] = decision.eventId
+    -- One fixed line per checked player (never who): the operator sees that the check ran and what came of it.
+    if decision.result == "pass" then
+      log("info", "a player was checked: allowed")
+    elseif decision.result == "block" then
+      log("info", "a player was checked: removed")
+    end
+    if decision.action == "deny" then
+      MP.DropPlayer(playerID, decision.message)
+    end
+  end)
+end
+
+-- Called every second: releases the players whose delay is up.
+function releaseWaiting()
+  local now = os.time()
+  for playerID, player in pairs(waiting) do
+    if now >= player.readyAt then
+      releasePlayer(playerID)
+    end
+  end
+end
+
 function onPlayerJoin(playerID)
   if not guard then
     return
@@ -613,20 +700,31 @@ function onPlayerJoin(playerID)
     end
   end
 
-  if #platformIds > 0 and not showNotice(playerID) then
-    log("warn", "the notice could not be shown, so this player was not checked")
-    return
+  if #platformIds == 0 then
+    -- Said out loud, because the portal counts this player as online (BeamMP lists guests) but has nothing
+    -- else about them: nothing is sent, so there is no join, no check and no statistic.
+    log(
+      "info",
+      "a guest joined: guests have no account id, so they cannot be checked and nothing is sent about them"
+        .. " (to refuse guests, set AllowGuests = false in BeamMP's ServerConfig.toml)"
+    )
   end
 
-  guard:check({ ip = identifiers.ip, platformIds = platformIds }, function(decision)
-    joins[playerID] = decision.eventId
-    if decision.action == "deny" then
-      MP.DropPlayer(playerID, decision.message)
-    end
-  end)
+  if #platformIds == 0 then
+    -- Nothing to wait for: there is nothing to check. (The core records it as skipped.)
+    guard:check({ ip = identifiers.ip, platformIds = platformIds }, function(decision)
+      joins[playerID] = decision.eventId
+    end)
+    return
+  end
+  waiting[playerID] = { readyAt = os.time() + settings.noticeDelay, ip = identifiers.ip, platformIds = platformIds }
+  if settings.noticeDelay == 0 then
+    releasePlayer(playerID)
+  end
 end
 
 function onPlayerDisconnect(playerID)
+  waiting[playerID] = nil
   local eventId = joins[playerID]
   joins[playerID] = nil
   if guard then
@@ -901,6 +999,7 @@ function onChatMessage(playerID, playerName, message)
   if not guard or type(message) ~= "string" then
     return nil
   end
+  releasePlayer(playerID) -- they are talking, so they are in the game and can be shown the notice now
   local word, rest = message:match("^%s*/(%S+)%s*(.-)%s*$")
   if word and word:lower() == "report" then
     handleReport(playerID, rest)
@@ -942,6 +1041,7 @@ end
 -- onVehicleSpawn is also run by other plugins, one of which may cancel the spawn afterwards; this
 -- plugin cannot tell, so a cancelled spawn is still reported (and tracked until the vehicle is deleted).
 function onVehicleSpawn(playerID, vehicleID, data)
+  releasePlayer(playerID) -- a car has spawned: they are in the game, so they can be shown the notice now
   vehicles[playerID] = vehicles[playerID] or {}
   vehicles[playerID][vehicleID] = vehicleModel(data)
   if guard then
