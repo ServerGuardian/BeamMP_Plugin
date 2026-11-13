@@ -12,6 +12,16 @@ A BeamMP server plugin that asks ServerGuardian whether a joining player is link
 
 Players with a BeamMP guest session have no account id, so they cannot be checked or banned; they are let in and nothing is sent. That makes guests a way around any ban. To refuse them, set `AllowGuests = false` under `[General]` in BeamMP's `ServerConfig.toml` (or `BEAMMP_ALLOW_GUESTS=false`): it is BeamMP's own setting, and your choice.
 
+## The notice as a popup in the game (client mod)
+
+With the **ServerGuardian client mod** installed, the notice is shown as a popup after the loading screen, the server is told it was shown, and only then is the player checked. This is the reliable way: the mod knows when the player's game has finished loading (BeamMP's server has no event for that), and the plugin no longer has to guess whether a chat line arrived.
+
+- **Install:** build the mod with `client/build.sh` (or take `serverguardian-client.zip` from the portal's downloads) and put the zip, named `ServerGuardianClient.zip`, in the server's `Resources/Client/` folder. Players download it automatically when they join. The plugin looks for that file when it starts and says so in the console (`client mod found` or `client mod not found`); with no zip it behaves as before, with the notice in chat.
+- **What happens:** the mod tells the server its game has loaded (`sgClientReady`); the plugin sends it the notice (`sgNotice`); the mod opens the popup and says so (`sgNoticeShown`); the plugin checks the player. A player whose mod never answers, or never confirms, gets the notice in chat and is checked after `popupFallbackSeconds` (default 45). While the popup is in use, a first car spawn or chat line does not release a player early.
+- **Settings in `config.json`:** `clientPopup` (`true` by default; `false` turns the popup off and keeps the chat notice, even with the mod installed), `popupFallbackSeconds` (10 to 300, default 45), `clientModFile` (a plain `.zip` name if you renamed the file) and a `popup` block: `title` (default `ServerGuardian`), `button` (default `I understand`) and `extra`, up to five lines of your own text (a welcome, your rules) shown below the notice. **The notice itself comes from ServerGuardian and cannot be changed here.** Everything you set is shown as plain text.
+- **The protocol** (three events, JSON in a string, versioned) is in `client/README.md`.
+- **Status:** the plugin's side is tested; the mod has **not been run inside BeamNG** yet, see `client/README.md` for what is unverified.
+
 ## When a player is shown the notice, and checked
 
 BeamMP raises `onPlayerJoin` when a player *starts* syncing: their game is still loading the map and the other players' cars, and a chat line sent then is not seen (BeamMP has no event for "finished loading"). So the plugin waits: the player is shown the ServerGuardian notice, and only then checked, as soon as **their first car spawns or they first say something** (they are certainly in the game then), or **15 seconds after they joined**, whichever comes first. Nothing is sent about a player before the notice. Change the 15 with `noticeDelaySeconds` in `config.json` (0 to 120; 0 restores the old behaviour of acting at once). A player who leaves before then is simply forgotten.

@@ -37,6 +37,7 @@ local joins = {} -- playerID -> eventId of the join we checked
 -- checked, because their game is probably still loading (see loadSettings, noticeDelaySeconds).
 local waiting = {}
 local releasePlayer, releaseWaiting -- defined below, used by timers and handlers that come before them
+local clientReady = {} -- playerID -> true once their client mod has said it finished loading (see sgClientReady)
 -- playerID -> { [vehicleID] = model name }, for the movement checks and so a delete (which carries no
 -- data) can say what was deleted. Memory only, and forgotten when the player leaves.
 local vehicles = {}
@@ -77,6 +78,28 @@ local function env(name)
   return value
 end
 
+local function fileExists(path)
+  local file = io.open(path, "rb")
+  if file then
+    file:close()
+    return true
+  end
+  return false
+end
+
+-- One line of operator text for the popup: control characters become spaces, ends trimmed, cut to `max`.
+-- nil when it is not text or ends up empty. (The client mod escapes it again: this is only tidiness.)
+local function cleanLine(value, max)
+  if type(value) ~= "string" then
+    return nil
+  end
+  local line = value:gsub("%c", " "):gsub("^%s+", ""):gsub("%s+$", "")
+  if line == "" then
+    return nil
+  end
+  return line:sub(1, max)
+end
+
 local function loadSettings()
   local dir = DEFAULT_DIR
   local raw = readFile(dir .. "/config.json")
@@ -111,6 +134,28 @@ local function loadSettings()
   elseif noticeDelay > 120 then
     noticeDelay = 120
   end
+  -- The notice as a popup in the game, from the ServerGuardian client mod (client/ in this repository), which
+  -- the server owner puts in Resources/Client. On by default; it only takes effect when the mod's zip is there.
+  local popup = type(decoded.popup) == "table" and decoded.popup or {}
+  local popupExtra = {}
+  if type(popup.extra) == "table" then
+    for _, line in ipairs(popup.extra) do
+      local clean = cleanLine(line, 300)
+      if clean and #popupExtra < 5 then
+        popupExtra[#popupExtra + 1] = clean
+      end
+    end
+  end
+  local clientModFile = type(decoded.clientModFile) == "string" and decoded.clientModFile:match("^[%w%._%-]+%.zip$")
+    or "ServerGuardianClient.zip"
+  -- How long to wait for the client mod to say it has loaded, and then for the popup to be shown, before the
+  -- notice goes in chat instead.
+  local popupFallback = tonumber(decoded.popupFallbackSeconds) or 45
+  if popupFallback < 10 then
+    popupFallback = 10
+  elseif popupFallback > 300 then
+    popupFallback = 300
+  end
   local bannerStyle = decoded.bannerStyle
   if bannerStyle ~= "braille" and bannerStyle ~= "ascii" then
     bannerStyle = "auto"
@@ -128,6 +173,12 @@ local function loadSettings()
     curl = curl,
     timeout = timeout,
     noticeDelay = noticeDelay,
+    clientPopup = decoded.clientPopup ~= false,
+    clientModFile = clientModFile,
+    popupFallback = popupFallback,
+    popupTitle = cleanLine(popup.title, 80) or "ServerGuardian",
+    popupButton = cleanLine(popup.button, 40) or "I understand",
+    popupExtra = popupExtra,
     bannerStyle = bannerStyle,
     -- The old top-level failMode only matters until the API has answered, as before; the "settings"
     -- block below is what sets the server's behaviour now.
@@ -549,7 +600,20 @@ function onInit()
   -- About once a minute the plugin says it is there, with how many players are on, so the portal can
   -- show the server online or offline. It runs whether or not game events or reports are on.
   MP.CreateEventTimer(HEARTBEAT_EVENT, ServerGuardianCore.HEARTBEAT_SECONDS * 1000)
+  settings.popupActive = settings.clientPopup and fileExists("Resources/Client/" .. settings.clientModFile)
   printStartBanner()
+  if settings.popupActive then
+    log("info", "client mod found (" .. settings.clientModFile .. "): the notice is shown as a popup in the game")
+  elseif settings.clientPopup then
+    log(
+      "info",
+      "client mod not found: the notice is sent in chat. Put "
+        .. settings.clientModFile
+        .. " in Resources/Client to show it as a popup in the game instead"
+    )
+  else
+    log("info", "the popup is off (clientPopup in config.json): the notice is sent in chat")
+  end
   -- Asked for in the background (see httpForCore): onInit returns now, and this runs a moment later from the
   -- one-second timer, with the answers in.
   guard:refreshConfig(function(ok)
@@ -642,16 +706,55 @@ local function showNotice(playerID)
   return true
 end
 
--- Shows the notice and runs the join check for a player who has been waiting. Called when their first car
--- spawns or they first speak (so they are certainly in the game), or by the one-second timer once
--- noticeDelaySeconds have passed, whichever comes first. Nothing is sent about a player before the notice.
-function releasePlayer(playerID)
+-- Sends the notice to the player's client mod, to be shown as a popup (see the client/ folder). Only for a player
+-- who is waiting, whose client mod has said it finished loading, on a server that has the mod's zip. A failed
+-- send (BeamMP says the player has not joined yet) is tried again on the next tick.
+local function offerPopup(playerID)
+  local player = waiting[playerID]
+  if not (player and guard and settings.popupActive) or player.popupSent then
+    return
+  end
+  local payload = Util.JsonEncode({
+    v = 1,
+    title = settings.popupTitle,
+    text = guard:noticeText(),
+    button = settings.popupButton,
+    extra = settings.popupExtra,
+    noticeVersion = guard.wording and guard.wording.noticeVersion or "",
+  })
+  -- Marked as sent BEFORE the call: the client's confirmation can come back before this function returns, and
+  -- it is only accepted for a player whose popup has been sent. Undone if BeamMP says it did not go.
+  player.popupSent = true
+  local previousReadyAt = player.readyAt
+  local called, sent = pcall(MP.TriggerClientEvent, playerID, "sgNotice", payload)
+  if called and sent ~= false then
+    -- Now wait for the player's client to say it showed it; if it never does, the chat notice takes over. (If the
+    -- confirmation already came, the player has been released and there is nothing left to set.)
+    if waiting[playerID] == player then
+      player.readyAt = os.time() + settings.popupFallback
+    end
+  else
+    player.popupSent = false
+    player.readyAt = previousReadyAt
+  end
+end
+
+-- Shows the notice and runs the join check for a player who has been waiting. `mode` says why:
+--   "popup"  the client mod has shown the notice (nothing to send in chat);
+--   "timer"  the wait is over (noticeDelaySeconds, or popupFallbackSeconds when the client mod is in use);
+--   nil      their first car spawned or they spoke, so they are certainly in the game (chat notice).
+-- When the client mod is in use, only "popup" and "timer" release a player: a spawn or a chat line does not,
+-- because the popup is how they are told. Nothing is sent about a player before the notice.
+function releasePlayer(playerID, mode)
   local player = waiting[playerID]
   if not player or not guard then
     return
   end
+  if settings.popupActive and mode ~= "popup" and mode ~= "timer" then
+    return
+  end
   waiting[playerID] = nil
-  if not showNotice(playerID) then
+  if mode ~= "popup" and not showNotice(playerID) then
     log("warn", "the notice could not be shown, so this player was not checked")
     return
   end
@@ -674,8 +777,28 @@ function releaseWaiting()
   local now = os.time()
   for playerID, player in pairs(waiting) do
     if now >= player.readyAt then
-      releasePlayer(playerID)
+      releasePlayer(playerID, "timer")
+    elseif clientReady[playerID] and not player.popupSent then
+      offerPopup(playerID) -- the first attempt did not go through
     end
+  end
+end
+
+-- The client mod tells the server its game has finished loading (BeamNG's loading screen has gone). This is the
+-- moment the notice can be shown: it is offered as a popup, and the player is checked once it has been shown.
+function sgClientReady(playerID)
+  if not guard or not settings.popupActive then
+    return
+  end
+  clientReady[playerID] = true
+  offerPopup(playerID)
+end
+
+-- The client mod says the popup has been shown. That is the notice delivered, so the check can run.
+function sgNoticeShown(playerID)
+  local player = waiting[playerID]
+  if player and player.popupSent then
+    releasePlayer(playerID, "popup")
   end
 end
 
@@ -720,14 +843,23 @@ function onPlayerJoin(playerID)
     end)
     return
   end
-  waiting[playerID] = { readyAt = os.time() + settings.noticeDelay, ip = identifiers.ip, platformIds = platformIds }
-  if settings.noticeDelay == 0 then
-    releasePlayer(playerID)
+  -- With the client mod in use the wait is for it (popupFallbackSeconds, at least noticeDelaySeconds): a
+  -- player without it, or whose mod never answers, gets the notice in chat after that.
+  local wait = settings.noticeDelay
+  if settings.popupActive then
+    wait = math.max(wait, settings.popupFallback)
+  end
+  waiting[playerID] = { readyAt = os.time() + wait, ip = identifiers.ip, platformIds = platformIds }
+  if clientReady[playerID] then
+    offerPopup(playerID) -- their client mod was ready before BeamMP told us they joined
+  elseif settings.noticeDelay == 0 and not settings.popupActive then
+    releasePlayer(playerID, "timer")
   end
 end
 
 function onPlayerDisconnect(playerID)
   waiting[playerID] = nil
+  clientReady[playerID] = nil
   local eventId = joins[playerID]
   joins[playerID] = nil
   if guard then
@@ -1134,6 +1266,8 @@ MP.RegisterEvent(FLUSH_EVENT, "sgGameFlush")
 MP.RegisterEvent(SAMPLE_EVENT, "sgGameSample")
 MP.RegisterEvent(REFRESH_EVENT, "sgConfigRefresh")
 MP.RegisterEvent(HEARTBEAT_EVENT, "sgHeartbeat")
+MP.RegisterEvent("sgClientReady", "sgClientReady")
+MP.RegisterEvent("sgNoticeShown", "sgNoticeShown")
 MP.RegisterEvent("onPlayerJoin", "onPlayerJoin")
 MP.RegisterEvent("onPlayerDisconnect", "onPlayerDisconnect")
 MP.RegisterEvent("onConsoleInput", "onConsoleInput")

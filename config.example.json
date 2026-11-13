@@ -4,6 +4,13 @@
   "timeoutSeconds": 3,
   "noticeDelaySeconds": 15,
   "bannerStyle": "auto",
+  "clientPopup": true,
+  "popupFallbackSeconds": 45,
+  "popup": {
+    "title": "ServerGuardian",
+    "button": "I understand",
+    "extra": []
+  },
   "curlPath": "curl",
   "recordKicks": false,
   "settings": {
