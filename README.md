@@ -22,6 +22,18 @@ With the **ServerGuardian client mod** installed, the notice is shown as a popup
 - **The protocol** (three events, JSON in a string, versioned) is in `client/README.md`.
 - **Status:** the plugin's side is tested; the mod has **not been run inside BeamNG** yet, see `client/README.md` for what is unverified.
 
+## The /report window (client mod)
+
+Players whose game has the client mod can type `/report` on its own and get a **window** in the game instead of the typed command: a list of the other players on the server (those with a BeamMP account; guests cannot be reported), a list of reasons, a box for a short note, the report notice, and Send and Cancel. Pressing Send is the confirmation the typed command asks for. The report then goes through exactly the same code as `/report <player> <category> [note]` (the same limits, the same notice, the same server staff), and the window shows the result. A player without the mod, or when reports are off, still has the typed command; `/report` with words after it always works as the typed command.
+
+In `config.json`, `reportWindow`:
+
+- `enabled`: `false` turns the window off and keeps the typed command (default `true`; it only appears when reports are on for the server and the client mod's zip is in `Resources/Client/`).
+- `title`: the window's title (default `Report a player`).
+- `reasons`: the reasons to offer, as category ids (`cheating`, `griefing`, `harassment`, `hate_or_abuse`, `other`), or `{ "id": "griefing", "label": "Wrecking other cars" }` to rename one. Only categories ServerGuardian accepts can be offered; the default is all of them, in that order, with the wording ServerGuardian gives. A reason not on your list is refused even if a modified game sends it.
+
+The plugin checks every request from the window as if a stranger sent it (the player must be here and have an account, not be the reporter, the reason must be offered, the note is cut to 200 bytes on a character boundary and stripped of control characters), and a window can be opened at most once every two seconds per player. Protocol: `client/README.md`. Not run inside BeamNG yet.
+
 ## When a player is shown the notice, and checked
 
 BeamMP raises `onPlayerJoin` when a player *starts* syncing: their game is still loading the map and the other players' cars, and a chat line sent then is not seen (BeamMP has no event for "finished loading"). So the plugin waits: the player is shown the ServerGuardian notice, and only then checked, as soon as **their first car spawns or they first say something** (they are certainly in the game then), or **15 seconds after they joined**, whichever comes first. Nothing is sent about a player before the notice. Change the 15 with `noticeDelaySeconds` in `config.json` (0 to 120; 0 restores the old behaviour of acting at once). A player who leaves before then is simply forgotten.

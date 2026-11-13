@@ -11,6 +11,11 @@
     "button": "I understand",
     "extra": []
   },
+  "reportWindow": {
+    "enabled": true,
+    "title": "Report a player",
+    "reasons": ["cheating", "griefing", "harassment", "hate_or_abuse", "other"]
+  },
   "curlPath": "curl",
   "recordKicks": false,
   "settings": {

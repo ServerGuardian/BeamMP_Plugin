@@ -4,7 +4,9 @@ A small BeamNG.drive / BeamMP client mod (game-engine Lua, no UI files, no asset
 
 Players without the mod are unaffected: they never send `sgClientReady`, so the server can fall back to the chat notice.
 
-**Status:** unit-tested under a fake BeamNG/BeamMP client environment (Backend `tests/mod-kit/client_mod_test.lua`, also run under LuaJIT, the game's Lua). **Never run inside BeamNG or BeamMP.** See "Not verified in the game" below.
+The mod has a second extension, the **report window** (`serverguardianReport.lua`, see "Report window" below): a player types `/report` in chat, the server sends `sgReportOpen`, and the client shows an in-game window to pick a player, a reason and write a short note, then sends `sgReportSubmit`.
+
+**Status:** unit-tested under a fake BeamNG/BeamMP client environment (Backend `tests/mod-kit/client_mod_test.lua` for the notice, `tests/mod-kit/client_report_test.lua` for the report window, both also run under LuaJIT, the game's Lua). **Never run inside BeamNG or BeamMP.** See "Not verified in the game" and "Report window: not verified in the game" below.
 
 ## What it does, and does not do
 
@@ -67,7 +69,7 @@ The mod stays loaded for the whole game session (`manual` unload), so a player c
 2. Put it in the BeamMP server's `Resources/Client/` folder. Players download it automatically when they join; nothing to install by hand.
 3. Restart the server so it serves the new mod, and use a plugin version that speaks this protocol.
 
-The zip has `scripts/serverguardian/modScript.lua` and `lua/ge/extensions/serverguardian.lua` at its root, nothing else. `modScript.lua` loads the extension as `serverguardian` with manual unload, the same way BeamNG's own mods do.
+The zip has `scripts/serverguardian/modScript.lua`, `lua/ge/extensions/serverguardian.lua` and `lua/ge/extensions/serverguardianReport.lua` at its root, nothing else. `modScript.lua` loads both extensions (`serverguardianReport` and `serverguardian`) with manual unload, the same way BeamNG's own mods do.
 
 ## Build the zip
 
@@ -107,6 +109,81 @@ Nothing here has run inside BeamNG or BeamMP. Specifically:
 - that `sgNoticeClosed` arrives when the player presses the button, and on Enter or a controller button;
 - the Lua 5.1 syntax was checked by running the tests under LuaJIT, but not inside the game's own Lua build.
 
+## Report window
+
+`lua/ge/extensions/serverguardianReport.lua`, loaded by `modScript.lua` as `serverguardianReport` (manual unload, depends on the game's `ui_imgui`). It is independent of the notice extension; both use the handler source name `serverguardian`.
+
+### Protocol
+
+All data are JSON strings, `v` is `1`. Handlers are registered with `AddEventHandler(name, fn, "serverguardian")`, sends are `TriggerServerEvent(name, jsonString)`.
+
+| Event | Direction | Data |
+|---|---|---|
+| `sgReportReady` | client to server | `{"v":1,"mod":"0.1.0"}` |
+| `sgReportOpen` | server to client | `{"v":1,"title":"Report a player","players":[{"id":3,"name":"Bob"}],"reasons":[{"id":"cheating","label":"Cheating"}],"notice":"...","noteMax":200,"send":"Send report","cancel":"Cancel"}` |
+| `sgReportSubmit` | client to server | `{"v":1,"target":3,"reason":"cheating","note":"..."}` |
+| `sgReportResult` | server to client | `{"v":1,"ok":true,"message":"..."}` |
+
+**`sgReportReady`** says only "this client can show the report window" (the mod version is the only other content). It is sent once per join, at each `onLoadingScreenFadeout` after both handlers are registered, and also when the extension loads into a world that is already ready (`worldReadyState == 2`). It is not sent while the handlers are not registered (no `AddEventHandler`, or registration failed), and if `TriggerServerEvent` was missing or threw it is retried at the next fade-out. The server should only send `sgReportOpen` to a client that has sent it.
+
+**`sgReportOpen`** is untrusted in every field. Ignored (nothing shown, nothing sent) when `v` is not the number `1`, the payload is not a JSON object, over 100000 bytes, or there is no usable player or no usable reason. Otherwise:
+
+| Field | Rule |
+|---|---|
+| `title` | string, at most 80 characters, default `Report a player` |
+| `players` | list, at most 100 used. Entry: `id` must be a number that is a whole number from 0 to 2147483647 (anything else drops the entry, as does a repeated `id`); `name` at most 60 characters, default `Player <id>` |
+| `reasons` | list, at most 12 used. Entry: `id` must be a string matching `^[a-z_]{1,40}$` (else the entry is dropped, as is a repeated id); `label` at most 60 characters, default the id |
+| `notice` | string, at most 1000 characters, plain text, blank lines and newlines kept, shown wrapped at the top of the window; none shown if empty |
+| `noteMax` | number, rounded down and clamped to 1..300, default 200 (also for anything that is not a finite number) |
+| `send`, `cancel` | strings, at most 40 characters, defaults `Send report` and `Cancel` |
+
+Every string has control characters, invalid UTF-8, C1 controls, line and paragraph separators and bidirectional overrides removed (a tab or newline in a one-line field becomes a space); `##` is changed to `# #` in text used as an imgui label (imgui reads `##` as an id separator and would cut the text there). Lengths count characters. Opening while the window is open is ignored; a window the player closed can be opened again by a new `sgReportOpen`. At most one `sgReportOpen` is looked at per second (valid or not; measured by summing the frame time given to `onUpdate`), so a flood costs next to nothing.
+
+**`sgReportSubmit`** is sent when the player presses Send. `target` is the chosen player's `id` as an integer, `reason` the chosen reason `id`, `note` what the player typed: trimmed, cut at the first NUL byte of the buffer, cleaned as above (newlines kept, a tab becomes a space, other control characters removed), then cut to `noteMax` characters (characters, not bytes), then trimmed again. The JSON is built by hand: `"`, `\`, newline, tab, carriage return and any other character below 0x20 are escaped, everything else (UTF-8 included) is written as it is. Send is greyed out and ignored until a player and a reason are chosen, and while a submit is waiting for its result (up to 15 seconds, then it is enabled again and the window says there was no answer; a result that arrives later is still shown). If `TriggerServerEvent` is missing or throws, the window says so and Send is enabled again. A note longer than `noteMax` is allowed in the field (imgui cannot cap by characters); the counter turns red and says that only the first `noteMax` characters are sent.
+
+**`sgReportResult`** is ignored unless the window is open and `v` is `1` and `ok` is a boolean. `message` is cleaned to one line of at most 300 characters (a fixed English default if empty). The window shows it, green for `ok = true` and red for `false`, and stops waiting. `ok = false` keeps the window as it is so the player can try again. `ok = true` clears the chosen player, reason and note, keeps the window open so the message can be read, and turns the second button into `Close`.
+
+### Window
+
+A normal imgui window (title bar with the close button, no collapse, no saved settings, no docking), centred on the main viewport each time it appears, 460 by 430 at first, resizable (minimum 360 by 300). From the top: the notice, a `Player` combo box, a `Reason` combo box, `What happened (optional)` with a multi-line field of about `noteMax` characters and a `0 / 200` counter, the message of the last result, then the Send and Cancel buttons (labels from the server; `Close` after a success). The window is closed by the title-bar button, Cancel/Close, a new join (`onLoadingScreenFadeout`, everything forgotten: window, pending send, message, choices) and leaving the level (`onClientEndMission`). The window is drawn from `M.onUpdate`; `Begin` is always followed by `End`, and every push, disabled block and combo is closed even if a call fails. The note the player types is only ever in the `sgReportSubmit` payload: it is not logged, stored, or sent anywhere else. Nothing the server sent is ever logged; the log only has fixed lines (`report window opened`, `ignored a report result that could not be used`, ...).
+
+### Where each imgui call was taken from
+
+Read in the locally installed game (Steam: `.../steamapps/common/BeamNG.drive/lua`; the Wine prefix under `~/Wine/beamng-prefix` has only the user folder, not the game). The bindings are `common/extensions/ui/imgui_luaintf.lua` and `imgui_custom_luaintf.lua`, reached through the global `ui_imgui` (a startup extension, `ge/main.lua`; `imgui.lua` loads `imgui_api.lua`). The game version was not determined.
+
+| What | Call | Binding defined in | Used the same way in |
+|---|---|---|---|
+| `im = ui_imgui`, `M.dependencies = {"ui_imgui"}` | | `extensions/ui/imgui.lua` | `ge/extensions/ui/console.lua`, `ui/messagesDebugger.lua` |
+| drawn each frame | `M.onUpdate(dtReal, dtSim, dtRaw)` | `extensions.hook('onUpdate', ...)` in `ge/main.lua` | `ui/messagesDebugger.lua` |
+| window with open flag | `im.Begin(name, im.BoolPtr(true), flags)`, `im.End()` (End also when Begin returned false), `im.BoolPtr` | `imgui_luaintf.lua`, `imgui_custom_luaintf.lua` | `ui/messagesDebugger.lua`, `flowgraph/nodes/ui/imgui/imDialogue.lua` |
+| flags | `im.WindowFlags_NoCollapse`, `_NoSavedSettings`, `_NoDocking` added with `+` | `imgui_luaintf.lua` (enum block) | `ui/console.lua`, `core/metrics.lua` |
+| size and position | `im.SetNextWindowSize(v, im.Cond_FirstUseEver)`, `im.SetNextWindowSizeConstraints(min, max)`, `im.SetNextWindowPos(pos, cond, pivot)` (the pivot argument is in the binding's signature; no game file was found that uses it), `im.GetMainViewport()` with `.Pos` and `.Size`, `im.ImVec2` | `imgui_luaintf.lua`, `imgui_custom_luaintf.lua` | `ui/messagesDebugger.lua`, `core/metrics.lua`, `util/screenshotCreator/nodeOutpaint.lua` |
+| combo box | `im.BeginCombo(label, preview)`, `im.Selectable1(label, selected)`, `im.EndCombo()` (End only when Begin returned true), `im.SetNextItemWidth(im.GetContentRegionAvailWidth())` | `imgui_luaintf.lua`, `imgui_custom_luaintf.lua` | `career/modules/debug/vehOfferDebug.lua`, `ui/apps/minimap/minimap.lua`, `career/modules/debug/cargoContainerDebug.lua` |
+| note field | `im.ArrayChar(size, "")`, `im.ArraySize(buf)`, `im.InputTextMultiline("##id", buf, im.ArraySize(buf), im.ImVec2(-1, 90))`, read with `ffi.string(buf)` | `imgui_custom_luaintf.lua`, `imgui_luaintf.lua` | `ui/messagesDebugger.lua` (the same four calls) |
+| buttons | `im.Button(label)`, `im.SameLine()`, `im.BeginDisabled()` / `im.EndDisabled()` | `imgui_luaintf.lua` | `ui/messagesDebugger.lua`, `career/modules/marketplace.lua` (BeginDisabled) |
+| text | `im.TextUnformatted(text)` inside `im.PushTextWrapPos(0)` / `im.PopTextWrapPos()`, `im.Spacing()`, `im.Separator()` | `imgui_luaintf.lua` | `ui/messagesDebugger.lua` (TextUnformatted, Separator), `flowgraph/nodes/ui/imgui/elemental/imText.lua` (PushTextWrapPos plus TextWrapped, with arbitrary text) |
+| colour | `im.PushStyleColor2(im.Col_Text, im.ImVec4(r,g,b,a))`, `im.PopStyleColor(im.Int(1))`, `im.ImVec4`, `im.Int` | `imgui_luaintf.lua`, `imgui_custom_luaintf.lua` | `career/modules/debug/dealershipFilterDebug.lua` |
+
+`TextWrapped` (the brief's choice) was not used: the game's own wrapper formats its argument and then passes it on, and whether the engine side treats `%` in it as a format string was not checked, so `TextUnformatted` (which never formats) is used with `PushTextWrapPos(0)` instead. `jsonEncode` is not used (the payload is built by hand). A test (`client_report_test.lua`, "every imgui call in the extension...") scans the extension for every `im.<name>` and fails if it is not in the list of calls read in the game above.
+
+### Report window: not verified in the game
+
+Nothing here has run inside BeamNG or BeamMP. Everything below is unverified:
+
+- that the window appears, is readable, and that the combo boxes, the note field, the buttons and the title-bar close button work with the mouse and keyboard in a real session;
+- how a player gets the mouse pointer while driving (the game's usual way for its imgui windows), whether typing into the note field is kept away from the car controls and key bindings while the field has focus, and that the window does not hold the mouse or the keyboard after it is closed. Nothing special is done: it is a plain imgui window, like the game's own;
+- that `ffi.string(buffer)` on a buffer from `im.ArrayChar` stops at the first NUL (the game's own windows use it that way; the mod also cuts at the first NUL itself), and that `ArrayChar(size, "")` gives an empty field;
+- that `TextUnformatted` wraps at `PushTextWrapPos(0)` in the game's imgui (it does in upstream Dear ImGui; `TextWrapped` is the fallback);
+- that `SetNextWindowPos` with the pivot argument centres the window, and what `GetMainViewport().Pos` and `.Size` are with multiple monitors or the game's imgui viewports enabled;
+- that the window keeps its place when the player hides the game's UI (`ui_visibility`), and that a window stays usable on top of the game's own pause or menu screens;
+- that `onUpdate` is called for a manually loaded BeamMP client extension every frame, also while a loading screen or menu is up, and that `onClientEndMission` fires when the player leaves a BeamMP server (the hook name is in `ge/main.lua`);
+- that `onLoadingScreenFadeout` fires at every server join in a session that stays loaded (the same assumption as the notice); if it does not, `sgReportReady` is not sent for later joins and the server will not open the window;
+- BeamMP's handling of the events: that `sgReportOpen` and `sgReportResult` reach the handlers registered with the source name `serverguardian` next to the notice extension's `sgNotice` handler, and the size limits of one event packet;
+- the 15-second timeout and the one-per-second limit use the sum of the frame times passed to `onUpdate`, not a wall clock, so they run slower when the game's frame time is clamped or the game is paused;
+- the Lua 5.1 syntax was checked by running the tests under LuaJIT, but not inside the game's own Lua build.
+
 ## Tests
 
 `Backend/tests/mod-kit/client_mod_test.lua` (run with `lua client_mod_test.lua lua/ge/extensions/serverguardian.lua`, wrapped by `Backend/tests/mods.client-mod.test.ts`) runs the extension under a fake BeamNG and BeamMP client: events and payloads, one-time registration and retry, popup fields, duplicate and malformed notices, clamping, injection set, links, operator lines, missing globals, failing calls and the log never containing notice text.
+
+`Backend/tests/mod-kit/client_report_test.lua` (run with `lua client_report_test.lua lua/ge/extensions/serverguardianReport.lua`, wrapped by `Backend/tests/mods.client-report.test.ts`) runs the report extension under the same kind of fake game plus a scripted fake `ui_imgui` (what the player does in each frame is set per frame: pick a player or reason, type a note, press Send or Cancel, press the title-bar button): registration and the `sgReportReady` event (once per join, not before the handlers, retried), the window and what it shows, Send disabled until both choices, the exact `sgReportSubmit` payload and its escaping and character limit, results (failure keeps the window, success clears the form), one submit at a time and the 15-second timeout, floods of `sgReportOpen` and malformed, oversized and hostile payloads, per-join reset, missing and failing globals, balanced imgui stacks, the log containing only fixed lines, and that every imgui call used was read in the game's source.

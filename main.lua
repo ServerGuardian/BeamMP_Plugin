@@ -38,6 +38,8 @@ local joins = {} -- playerID -> eventId of the join we checked
 local waiting = {}
 local releasePlayer, releaseWaiting -- defined below, used by timers and handlers that come before them
 local clientReady = {} -- playerID -> true once their client mod has said it finished loading (see sgClientReady)
+local lastReportOpen = {} -- playerID -> when their /report window was last opened (see openReportWindow)
+local reportReady = {} -- playerID -> true once their client mod has said it can show the /report window
 -- playerID -> { [vehicleID] = model name }, for the movement checks and so a delete (which carries no
 -- data) can say what was deleted. Memory only, and forgotten when the player leaves.
 local vehicles = {}
@@ -156,6 +158,17 @@ local function loadSettings()
   elseif popupFallback > 300 then
     popupFallback = 300
   end
+  -- The /report window (client mod, see client/): on by default when reports are on and the mod is installed.
+  local reportWindow = type(decoded.reportWindow) == "table" and decoded.reportWindow or {}
+  local reportReasons = {}
+  if type(reportWindow.reasons) == "table" then
+    for _, reason in ipairs(reportWindow.reasons) do
+      local id = type(reason) == "string" and reason or (type(reason) == "table" and reason.id) or nil
+      if type(id) == "string" and id:match("^[a-z_]+$") and #id <= 40 and #reportReasons < 12 then
+        reportReasons[#reportReasons + 1] = { id = id, label = type(reason) == "table" and cleanLine(reason.label, 60) or nil }
+      end
+    end
+  end
   local bannerStyle = decoded.bannerStyle
   if bannerStyle ~= "braille" and bannerStyle ~= "ascii" then
     bannerStyle = "auto"
@@ -179,6 +192,9 @@ local function loadSettings()
     popupTitle = cleanLine(popup.title, 80) or "ServerGuardian",
     popupButton = cleanLine(popup.button, 40) or "I understand",
     popupExtra = popupExtra,
+    reportWindow = reportWindow.enabled ~= false,
+    reportTitle = cleanLine(reportWindow.title, 80) or "Report a player",
+    reportReasons = reportReasons,
     bannerStyle = bannerStyle,
     -- The old top-level failMode only matters until the API has answered, as before; the "settings"
     -- block below is what sets the server's behaviour now.
@@ -600,7 +616,8 @@ function onInit()
   -- About once a minute the plugin says it is there, with how many players are on, so the portal can
   -- show the server online or offline. It runs whether or not game events or reports are on.
   MP.CreateEventTimer(HEARTBEAT_EVENT, ServerGuardianCore.HEARTBEAT_SECONDS * 1000)
-  settings.popupActive = settings.clientPopup and fileExists("Resources/Client/" .. settings.clientModFile)
+  settings.clientModFound = fileExists("Resources/Client/" .. settings.clientModFile)
+  settings.popupActive = settings.clientPopup and settings.clientModFound
   printStartBanner()
   if settings.popupActive then
     log("info", "client mod found (" .. settings.clientModFile .. "): the notice is shown as a popup in the game")
@@ -613,6 +630,9 @@ function onInit()
     )
   else
     log("info", "the popup is off (clientPopup in config.json): the notice is sent in chat")
+  end
+  if settings.clientModFound and settings.reportWindow then
+    log("info", "/report opens a report window for players with the client mod (reportWindow in config.json)")
   end
   -- Asked for in the background (see httpForCore): onInit returns now, and this runs a moment later from the
   -- one-second timer, with the answers in.
@@ -787,11 +807,11 @@ end
 -- The client mod tells the server its game has finished loading (BeamNG's loading screen has gone). This is the
 -- moment the notice can be shown: it is offered as a popup, and the player is checked once it has been shown.
 function sgClientReady(playerID)
-  if not guard or not settings.popupActive then
+  if not guard or not settings.clientModFound then
     return
   end
   clientReady[playerID] = true
-  offerPopup(playerID)
+  offerPopup(playerID) -- (does nothing unless the popup is in use and the player is waiting)
 end
 
 -- The client mod says the popup has been shown. That is the notice delivered, so the check can run.
@@ -860,6 +880,8 @@ end
 function onPlayerDisconnect(playerID)
   waiting[playerID] = nil
   clientReady[playerID] = nil
+  reportReady[playerID] = nil
+  lastReportOpen[playerID] = nil
   local eventId = joins[playerID]
   joins[playerID] = nil
   if guard then
@@ -1079,7 +1101,219 @@ local function say(playerID, text)
   end
 end
 
+-- ---- The /report window (client mod) --------------------------------------------------------------------------
+-- `/report` with nothing after it opens a window on the player's screen: the server sends the list of players and
+-- the reasons (sgReportOpen), the window sends the choice back (sgReportSubmit) and the server answers
+-- (sgReportResult). The report itself then goes through exactly the same code as the typed command, with its
+-- limits. A player whose game has no client mod still has the typed command.
+local REPORT_REASON_ORDER = { "cheating", "griefing", "harassment", "hate_or_abuse", "other" }
+local REPORT_NOTE_MAX = 200
+local REPORT_OPEN_COOLDOWN = 2 -- seconds between windows for one player
+
+-- The first `max` characters of `text` (never half of a multi-byte one).
+local function firstChars(text, max)
+  if type(utf8) ~= "table" then
+    return text:sub(1, max) -- a Lua without the utf8 library: cut by bytes
+  end
+  local length = utf8.len(text)
+  if not length then
+    return (text:gsub("[\128-\255]", ""))
+  end
+  if length <= max then
+    return text
+  end
+  return text:sub(1, utf8.offset(text, max + 1) - 1)
+end
+
+local function reportWindowUsable(playerID)
+  return guard ~= nil
+    and guard.reportsEnabled == true
+    and settings.reportWindow
+    and settings.clientModFound
+    and clientReady[playerID] == true
+    and reportReady[playerID] == true
+end
+
+-- The client mod says its game can show the /report window. Without this (an older mod, or none) /report stays
+-- the typed command: the plugin never opens a window a player's game cannot show.
+function sgReportReady(playerID)
+  if guard and settings.clientModFound then
+    reportReady[playerID] = true
+  end
+end
+
+-- Who can be reported from this player's window: everyone connected with a BeamMP account, except themselves.
+local function reportablePlayers(playerID)
+  local identifiers = MP.GetPlayerIdentifiers(playerID)
+  local own = identifiers and identifiers.beammp
+  local list = {}
+  local names = MP.GetPlayers()
+  if type(names) == "table" then
+    for id, name in pairs(names) do
+      local number = tonumber(id)
+      if number and number ~= tonumber(playerID) and type(name) == "string" and #list < 100 then
+        local theirs = MP.GetPlayerIdentifiers(number)
+        local account = theirs and theirs.beammp
+        if type(account) == "string" and account ~= "" and account ~= own then
+          list[#list + 1] = { id = number, name = firstChars(cleanLine(name, 120) or "?", 60), account = account }
+        end
+      end
+    end
+  end
+  table.sort(list, function(a, b)
+    local left, right = a.name:lower(), b.name:lower()
+    if left == right then
+      return a.id < b.id
+    end
+    return left < right
+  end)
+  return list
+end
+
+-- The reasons offered: the server owner's own list when they set one, else every category the API knows, in a
+-- fixed order. Only categories the API accepts can be offered; the owner may only rename them.
+local function reportReasonList()
+  local categories = guard.reportWording.categories
+  local list = {}
+  local function add(id, label)
+    if categories[id] then
+      list[#list + 1] = { id = id, label = firstChars(cleanLine(label or categories[id], 60) or id, 60) }
+    end
+  end
+  if #settings.reportReasons > 0 then
+    for _, reason in ipairs(settings.reportReasons) do
+      add(reason.id, reason.label)
+    end
+  else
+    local seen = {}
+    for _, id in ipairs(REPORT_REASON_ORDER) do
+      seen[id] = true
+      add(id)
+    end
+    local extra = {}
+    for id in pairs(categories) do
+      if not seen[id] and type(id) == "string" and id:match("^[a-z_]+$") then
+        extra[#extra + 1] = id
+      end
+    end
+    table.sort(extra)
+    for _, id in ipairs(extra) do
+      add(id)
+    end
+  end
+  return list
+end
+
+local function reportResult(playerID, ok, message)
+  pcall(MP.TriggerClientEvent, playerID, "sgReportResult", Util.JsonEncode({ v = 1, ok = ok, message = firstChars(message, 300) }))
+end
+
+local function openReportWindow(playerID)
+  local now = os.time()
+  if lastReportOpen[playerID] and now - lastReportOpen[playerID] < REPORT_OPEN_COOLDOWN then
+    return
+  end
+  lastReportOpen[playerID] = now
+  guard:refreshConfig(nil, false)
+  local players = reportablePlayers(playerID)
+  local reasons = reportReasonList()
+  if #players == 0 then
+    say(playerID, "There is nobody else here who can be reported.")
+    return
+  end
+  if #reasons == 0 then
+    say(playerID, "Reports are not set up on this server.")
+    return
+  end
+  local shown = {}
+  for index, player in ipairs(players) do
+    shown[index] = { id = player.id, name = player.name }
+  end
+  pcall(MP.TriggerClientEvent, playerID, "sgReportOpen", Util.JsonEncode({
+    v = 1,
+    title = settings.reportTitle,
+    players = shown,
+    reasons = reasons,
+    notice = firstChars(guard.reportWording.notice, 1000),
+    noteMax = REPORT_NOTE_MAX,
+    send = "Send report",
+    cancel = "Cancel",
+  }))
+end
+
+-- The window sends the player's choice. Checked as if a stranger sent it (a modified game can send anything),
+-- then handed to the same report code as the typed command. The window showed the report notice, so pressing
+-- Send is the confirmation the typed command asks for.
+function sgReportSubmit(playerID, data)
+  if not reportWindowUsable(playerID) then
+    return
+  end
+  local decoded, request = pcall(Util.JsonDecode, data)
+  if not decoded or type(request) ~= "table" or request.v ~= 1 then
+    return
+  end
+  -- A player id is a whole NUMBER in the request (not text that looks like one). Whether BeamMP's JSON decoder gives
+  -- 1 or 1.0 is not something to depend on, so any whole number is taken.
+  local target = request.target
+  local reason = request.reason
+  if
+    type(target) ~= "number"
+    or target ~= math.floor(target)
+    or target < 0
+    or target > 100000
+    or type(reason) ~= "string"
+    or #reason > 40
+    or (request.note ~= nil and type(request.note) ~= "string")
+  then
+    reportResult(playerID, false, "That report could not be read. Please try again.")
+    return
+  end
+  if #settings.reportReasons > 0 then
+    local offered = false
+    for _, allowed in ipairs(settings.reportReasons) do
+      offered = offered or allowed.id == reason
+    end
+    if not offered then
+      reportResult(playerID, false, "That reason is not offered on this server.")
+      return
+    end
+  end
+  target = math.floor(target)
+  local note = firstChars(cleanLine(request.note or "", 4 * REPORT_NOTE_MAX) or "", REPORT_NOTE_MAX)
+  local chosen
+  for _, player in ipairs(reportablePlayers(playerID)) do
+    if player.id == target then
+      chosen = player
+    end
+  end
+  local identifiers = MP.GetPlayerIdentifiers(playerID)
+  local account = identifiers and identifiers.beammp
+  if not chosen then
+    reportResult(playerID, false, "That player is not here any more, or cannot be reported.")
+    return
+  end
+  guard:refreshConfig(nil, false)
+  local key = tostring(playerID)
+  guard.reportConfirmed[key] = true
+  guard:reportCommand({
+    key = key,
+    reporterIds = (type(account) == "string" and account ~= "") and { { type = "beammp", id = account } } or nil,
+    typed = chosen.name,
+    category = reason,
+    note = note ~= "" and note or nil,
+    resolve = function()
+      return { ids = { { type = "beammp", id = chosen.account } }, label = chosen.name }
+    end,
+  }, function(text)
+    reportResult(playerID, text == guard.reportWording.thanks, text)
+  end)
+end
+
 local function handleReport(playerID, rest)
+  if rest == "" and reportWindowUsable(playerID) then
+    openReportWindow(playerID)
+    return
+  end
   local identifiers = MP.GetPlayerIdentifiers(playerID)
   local account = identifiers and identifiers.beammp
   local reporterIds = nil
@@ -1268,6 +1502,8 @@ MP.RegisterEvent(REFRESH_EVENT, "sgConfigRefresh")
 MP.RegisterEvent(HEARTBEAT_EVENT, "sgHeartbeat")
 MP.RegisterEvent("sgClientReady", "sgClientReady")
 MP.RegisterEvent("sgNoticeShown", "sgNoticeShown")
+MP.RegisterEvent("sgReportSubmit", "sgReportSubmit")
+MP.RegisterEvent("sgReportReady", "sgReportReady")
 MP.RegisterEvent("onPlayerJoin", "onPlayerJoin")
 MP.RegisterEvent("onPlayerDisconnect", "onPlayerDisconnect")
 MP.RegisterEvent("onConsoleInput", "onConsoleInput")
