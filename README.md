@@ -16,6 +16,8 @@ Players with a BeamMP guest session have no account id, so they cannot be checke
 
 BeamMP raises `onPlayerJoin` when a player *starts* syncing: their game is still loading the map and the other players' cars, and a chat line sent then is not seen (BeamMP has no event for "finished loading"). So the plugin waits: the player is shown the ServerGuardian notice, and only then checked, as soon as **their first car spawns or they first say something** (they are certainly in the game then), or **15 seconds after they joined**, whichever comes first. Nothing is sent about a player before the notice. Change the 15 with `noticeDelaySeconds` in `config.json` (0 to 120; 0 restores the old behaviour of acting at once). A player who leaves before then is simply forgotten.
 
+BeamMP's Lua `MP.SendChatMessage` returns nothing (the success or failure is dropped between BeamMP's C++ and its Lua), so the plugin cannot tell whether a chat line reached a player, and a line sent to a client that is still syncing is silently skipped. The plugin therefore treats "no answer" as sent and relies on the wait above; only a server version that does return `false` makes it report `the notice could not be shown` and skip the check. A BeamMP client mod can show the notice in a popup after the loading screen and confirm it back to the server, which would remove this guesswork.
+
 The price is that a banned player is removed after that wait (up to 15 seconds, or sooner when they spawn a car) instead of at the instant they join. A server that would rather check at once, accepting that the notice may be missed, can set 0.
 
 ## What you see when it starts

@@ -625,8 +625,11 @@ local function showNotice(playerID)
   for _, part in ipairs(chunks(guard:noticeText(), 180)) do
     local sent = false
     for _ = 1, 3 do
+      -- BeamMP-Server's Lua MP.SendChatMessage returns NOTHING (its C++ underneath returns success or failure,
+      -- but the Lua binding drops it), so "no value" means "sent as far as anyone can tell". Only an explicit
+      -- false, from a server version that does return one, is a failure.
       local ok = MP.SendChatMessage(playerID, part)
-      if ok then
+      if ok ~= false then
         sent = true
         break
       end
